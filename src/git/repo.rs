@@ -16,6 +16,11 @@ pub struct GitRepo {
 }
 
 impl GitRepo {
+    /// Returns the absolute path to the repository's working-tree root.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     /// Discovers the Git repository containing `directory`.
     ///
     /// `directory` may be either the repository root or any directory below it.
@@ -39,11 +44,6 @@ impl GitRepo {
         Ok(Self {
             root: PathBuf::from(root),
         })
-    }
-
-    /// Returns the absolute path to the repository's working-tree root.
-    pub fn root(&self) -> &Path {
-        &self.root
     }
 
     /// Executes Git in this repository without requiring a successful exit.

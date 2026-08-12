@@ -1,80 +1,81 @@
-mod git;
+use std::{path::PathBuf, time::Duration};
 
-use git::{GitRepo, StagedChangeKind};
+use clap::Parser;
+use git_sight::ollama;
+
+#[derive(Debug, Parser)]
+#[command(version, about = "Generate commit messages from staged changes")]
+struct Cli {
+    /// Repository to inspect.
+    #[arg(value_name = "PATH", default_value = ".")]
+    path: PathBuf,
+
+    /// Ollama model to use.
+    #[arg(long, default_value = "qwen3:4b-instruct")]
+    model: String,
+
+    /// Model context-window size, in tokens.
+    #[arg(short, long, default_value_t = 16_384)]
+    context_size: u32,
+
+    /// Keep the Ollama model loaded in memory after the request.
+    ///
+    /// Accepts human-readable durations such as `30s`, `5m`, or `1h`.
+    /// A duration of `0` unloads the model immediately after the request.
+    /// If omitted, Ollama's configured default is used.
+    #[arg(long, value_parser = humantime::parse_duration)]
+    keep_alive: Option<Duration>,
+}
 
 fn main() -> anyhow::Result<()> {
-    let repo = GitRepo::discover("../tmp")?;
+    let args = Cli::parse();
+    dbg!(&args);
 
-    println!("Repository: {}", repo.root().display());
-
-    match repo.current_branch()? {
-        Some(branch) => {
-            println!("Branch:     {branch}")
-        }
-        None => {
-            println!("Branch:     <detached HEAD>")
-        }
+    let ollama = ollama::Client::default();
+    let models = ollama.list_models()?;
+    println!("available Ollama models:");
+    println!("{:30}  {:>8}  {:>5}", "NAME", "SIZE", "LOCAL",);
+    for model in models {
+        println!(
+            "{:30}  {:5.2} GB  {:^5}",
+            model.model,
+            (model.size as f64) / 1024_f64.powi(3),
+            if model.is_local() { "✔" } else { " " },
+        )
     }
-
-    match repo.head_sha()? {
-        Some(sha) => println!("HEAD:       {sha}"),
-        None => println!("HEAD:       <no commits yet>"),
-    }
-
-    println!("Dirty:      {}", repo.is_dirty()?);
-
-    let changes = repo.staged_changes()?;
-
     println!();
-    println!("Staged changes: {}", changes.len());
 
-    for change in &changes {
-        match &change.kind {
-            StagedChangeKind::Added => {
-                println!("  added      {}", change.path.display());
-            }
+    let messages = vec![
+        ollama::Message {
+            role: ollama::Role::System,
+            content: "You are a scientifically correct, concise knowledge assistant.".to_string(),
+        },
+        ollama::Message {
+            role: ollama::Role::User,
+            content: "Why is the sky blue?".to_string(),
+        },
+    ];
+    let options = ollama::ChatOptions {
+        options: Some(ollama::ModelOptions {
+            num_ctx: Some(args.context_size),
+            num_predict: Some(256),
+            ..Default::default()
+        }),
+        keep_alive: args.keep_alive.map(Into::into),
+        ..Default::default()
+    };
+    dbg!(&options);
+    let answer = ollama.chat(args.model, messages, &options)?;
 
-            StagedChangeKind::Modified => {
-                println!("  modified   {}", change.path.display());
-            }
-
-            StagedChangeKind::Deleted => {
-                println!("  deleted    {}", change.path.display());
-            }
-
-            StagedChangeKind::Renamed { from, similarity } => {
-                println!(
-                    "  renamed    {} -> {} ({similarity}%)",
-                    from.display(),
-                    change.path.display(),
-                );
-            }
-
-            StagedChangeKind::TypeChanged => {
-                println!("  type       {}", change.path.display());
-            }
-
-            StagedChangeKind::Unmerged => {
-                println!("  unmerged   {}", change.path.display());
-            }
-        }
-    }
-
-    let diff = repo.staged_diff()?;
-    println!("Staged diff: {} bytes", diff.len());
-
-    let recent = repo.recent_commit_subjects(5)?;
-
+    println!("Model used: {:?}", answer.model);
+    println!("Done: {:?}", answer.done);
+    println!("Done reasoning: {:?}", answer.done_reason);
+    println!("prompt tokens: {:?}", answer.prompt_eval_count);
+    println!("tokens generated: {:?}", answer.eval_count);
     println!();
-    println!("Recent commits:");
+    println!("{}", answer.message.content);
 
-    if recent.is_empty() {
-        println!("  <none>");
-    } else {
-        for subject in recent {
-            println!("  {subject}");
-        }
-    }
+    // let repo = GitRepo::discover(args.path)?;
 
     Ok(())
 }

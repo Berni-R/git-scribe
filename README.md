@@ -31,3 +31,22 @@ Git automatically maps the `git sight` command to an executable named `git-sight
 ## Status
 
 This is currently just an early proof of concept written in Python.
+
+## Installation
+
+Install `git-sight` from the repository with Cargo:
+
+```sh
+cargo install --path .
+```
+
+This installs the `git-sight` executable into Cargo's binary directory (usually `~/.cargo/bin`),
+which must be on your `PATH`.
+
+Git automatically treats executables named `git-<command>` on your `PATH` as external Git commands.
+Therefore, both forms are equivalent:
+
+```sh
+git-sight [OPTIONS]
+git sight [OPTIONS]
+```
