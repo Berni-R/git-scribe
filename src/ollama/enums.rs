@@ -72,6 +72,7 @@ pub enum Think {
 
 impl Think {
     /// `true` if some level of thinking is turned on.
+    #[must_use]
     pub fn is_on(&self) -> bool {
         self != &Self::Off
     }
@@ -108,6 +109,7 @@ pub enum KeepAlive {
 
 impl KeepAlive {
     /// Keep the model loaded for the given positive number of seconds.
+    #[must_use]
     pub fn seconds(seconds: NonZeroU64) -> Self {
         Self::ForSeconds(seconds)
     }
@@ -117,6 +119,7 @@ impl KeepAlive {
     /// # Panics
     ///
     /// Panics if converting the duration to seconds would overflow a [`u64`].
+    #[must_use]
     pub fn minutes(minutes: NonZeroU64) -> Self {
         const SECONDS_PER_MINUTE: NonZeroU64 = NonZeroU64::new(60).expect("60 is non-zero");
 

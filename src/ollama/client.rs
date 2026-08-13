@@ -15,7 +15,7 @@ pub struct Client {
 impl Default for Client {
     fn default() -> Self {
         Self {
-            client: Default::default(),
+            client: reqwest::blocking::Client::default(),
             base_url: DEFAULT_BASE_URL.to_owned(),
         }
     }
@@ -53,9 +53,9 @@ impl Client {
     /// let response = self.client
     ///     .get(format!("{}/api/tags", self.base_url))
     ///     .timeout(Duration::from_secs(3));
-    /// let models: ListModelsResponse = self.call(response)?;
+    /// let models: ListModelsResponse = Client::call(response)?;
     /// ```
-    pub(super) fn call<T>(&self, request: RequestBuilder) -> Result<T, OllamaError>
+    pub(super) fn call<T>(request: RequestBuilder) -> Result<T, OllamaError>
     where
         T: DeserializeOwned,
     {
@@ -64,9 +64,10 @@ impl Client {
         let body = response.bytes()?;
 
         if !status.is_success() {
-            let message = serde_json::from_slice::<ErrorResponse>(&body)
-                .map(|response| response.error)
-                .unwrap_or_else(|_| String::from_utf8_lossy(&body).into_owned());
+            let message = serde_json::from_slice::<ErrorResponse>(&body).map_or_else(
+                |_| String::from_utf8_lossy(&body).into_owned(),
+                |response| response.error,
+            );
 
             return Err(OllamaError::Api { status, message });
         }

@@ -26,6 +26,8 @@ pub enum CommitMode {
 }
 
 impl CommitMode {
+    /// The base commit to use: `"HEAD"` for [`CommitMode::Normal`] and `"HEAD^` for [`CommitMode::Amend`].
+    #[must_use]
     pub(super) fn base(self) -> &'static str {
         match self {
             Self::Normal => "HEAD",
@@ -36,6 +38,7 @@ impl CommitMode {
 
 impl GitRepo {
     /// Returns the absolute path to the repository's working-tree root.
+    #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
     }

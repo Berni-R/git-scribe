@@ -18,7 +18,8 @@ pub struct Cli {
     ///
     /// Note:
     /// As of now (Aug 2026), models using Apple MLX framework do not respect the output format with Ollama.
-    /// (see: https://github.com/ollama/ollama/issues/16563)
+    ///
+    /// See <https://github.com/ollama/ollama/issues/16563>.
     #[arg(long, default_value = "qwen3.5:4b")]
     pub model: String,
 

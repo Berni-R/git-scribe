@@ -105,6 +105,7 @@ impl CommitMessage {
     /// Return the JSON schema expected for the model's structured response.
     ///
     /// The schema constrains the model to a [`CommitMessage`], describing its attributes meaning, types, etc..
+    #[must_use]
     pub fn schema() -> Value {
         json!({
             "type": "object",

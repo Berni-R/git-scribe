@@ -134,6 +134,7 @@ impl StagedChange {
     ///
     /// The format resembles Git status output and includes the change kind and affected path,
     /// plus the source path and similarity for renames.
+    #[must_use]
     pub fn summary_line(&self) -> String {
         match &self.kind {
             StagedChangeKind::Added => {

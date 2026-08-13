@@ -1,3 +1,6 @@
+#![warn(clippy::pedantic)]
+#![allow(clippy::missing_errors_doc)]
+
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
@@ -20,6 +23,8 @@ const NUM_PREDICT: i32 = 384; // TODO: should we even limit this?
 /// Minimum context reserved for model reasoning and the final response when generation itself is not capped.
 const THINKING_CONTEXT_RESERVE: u32 = 4_096;
 
+#[allow(clippy::too_many_lines)]
+#[allow(clippy::cast_precision_loss)]
 fn main() -> Result<()> {
     let args = cli::Cli::parse();
     args.validate()?;

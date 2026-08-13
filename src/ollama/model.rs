@@ -17,6 +17,7 @@ pub struct Model {
 
 impl Model {
     /// `true` if this is a local model.
+    #[must_use]
     pub fn is_local(&self) -> bool {
         self.remote_host.is_none()
     }
@@ -35,6 +36,6 @@ impl Client {
             .get(format!("{}/api/tags", self.base_url))
             .timeout(Duration::from_secs(3));
 
-        Ok(self.call::<ListModelsResponse>(response)?.models)
+        Ok(Self::call::<ListModelsResponse>(response)?.models)
     }
 }

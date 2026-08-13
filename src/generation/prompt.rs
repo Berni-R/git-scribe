@@ -174,7 +174,7 @@ fn render_prompt(
     diff: &str,
 ) -> String {
     format!(
-        r#"Suggest one commit message.
+        r"Suggest one commit message.
 
 ## Branch
 {branch}
@@ -195,7 +195,7 @@ fn render_prompt(
 ```diff
 {diff}
 ```
-"#
+"
     )
 }
 
@@ -245,6 +245,9 @@ fn readme(repo: &GitRepo, budget: usize) -> Result<String> {
 /// Clip text to the given estimated token budget, appending [`CLIP_SUFFIX`] when clipped.
 ///
 /// When clipping is required, the result always includes [`CLIP_SUFFIX`], even if the suffix itself exceeds `limit`.
+#[allow(clippy::cast_precision_loss)]
+#[allow(clippy::cast_possible_truncation)]
+#[allow(clippy::cast_sign_loss)]
 fn clip_tokens(text: &str, limit: usize) -> String {
     if estimate_tokens(text) <= limit {
         return text.to_owned();
@@ -258,6 +261,9 @@ fn clip_tokens(text: &str, limit: usize) -> String {
 }
 
 /// Conservatively estimate the number of tokens needed for the given text.
+#[allow(clippy::cast_precision_loss)]
+#[allow(clippy::cast_possible_truncation)]
+#[allow(clippy::cast_sign_loss)]
 fn estimate_tokens(text: &str) -> usize {
     (text.len() as f64 / ESTIMATED_BYTES_PER_TOKEN).ceil() as usize
 }

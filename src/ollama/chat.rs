@@ -153,7 +153,7 @@ impl Client {
             response = response.timeout(timeout);
         }
 
-        match self.call(response) {
+        match Self::call(response) {
             Err(
                 error @ OllamaError::Api {
                     status: StatusCode::NOT_FOUND,
