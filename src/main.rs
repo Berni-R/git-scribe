@@ -6,8 +6,8 @@ use std::time::Duration;
 use anyhow::{Context as _, Result, bail};
 use clap::Parser as _;
 use git_sight::{
+    GitRepo,
     generation::{CommitMessage, Confidence, Prompt},
-    git::GitRepo,
     ollama::{self, ChatOptions, KeepAlive, Message, ModelOptions, Role},
 };
 
@@ -44,7 +44,7 @@ fn main() -> Result<()> {
         bail!("no staged changes");
     }
 
-    let prompt = Prompt::new(&repo, mode, &changes, prompt_token_budget)?;
+    let prompt = Prompt::new(&repo, &args.context, mode, &changes, prompt_token_budget)?;
 
     eprintln!(
         "git-sight: {} file(s) in commit, ~{}/{} (~{:.0}%) prompt tokens used, {}",

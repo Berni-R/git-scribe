@@ -14,6 +14,10 @@ pub struct Cli {
     #[arg(long)]
     pub amend: bool,
 
+    /// Optional context or hints about the commit.
+    #[arg(long, value_name = "TEXT")]
+    pub context: Vec<String>,
+
     /// Ollama model to use (e.g. "gemma4:e2b", "qwen3.5:4b", "qwen3:4b-instruct", "mistral:7b").
     ///
     /// Note:
