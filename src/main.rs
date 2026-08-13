@@ -118,8 +118,15 @@ fn main() -> Result<()> {
         );
     }
 
-    let answer: CommitMessage =
-        serde_json::from_str(content).context("model returned invalid commit-message JSON")?;
+    let answer: CommitMessage = match serde_json::from_str(content) {
+        Ok(answer) => answer,
+        Err(error) => {
+            if !content.trim().contains('\n') {
+                println!("{}", content.trim()); // might still be a valid suggestion
+            }
+            return Err(error).context("model returned invalid commit-message JSON");
+        }
+    };
 
     if response.done_reason.as_deref() == Some("length") {
         eprintln!("git-sight: warning: model output hit the token limit");
