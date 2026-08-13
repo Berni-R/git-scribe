@@ -15,6 +15,25 @@ pub struct GitRepo {
     root: PathBuf,
 }
 
+/// Selects how the prospective commit is constructed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitMode {
+    /// Create a new commit from the changes between `HEAD` and the current index.
+    Normal,
+
+    /// Amend `HEAD`, using the changes between `HEAD^` and the current index.
+    Amend,
+}
+
+impl CommitMode {
+    pub(super) fn base(self) -> &'static str {
+        match self {
+            Self::Normal => "HEAD",
+            Self::Amend => "HEAD^", // TODO: `--amend` is valid for `git` if the tree is empty, but this then fails
+        }
+    }
+}
+
 impl GitRepo {
     /// Returns the absolute path to the repository's working-tree root.
     pub fn root(&self) -> &Path {

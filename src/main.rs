@@ -7,7 +7,7 @@ use std::{
 use anyhow::{Context as _, Result, bail};
 use clap::Parser;
 use git_sight::{
-    git::{GitRepo, StagedChange, StagedChangeKind},
+    git::{CommitMode, GitRepo, StagedChange, StagedChangeKind},
     ollama::{self, ChatOptions, KeepAlive, Message, ModelOptions, Role, Think},
 };
 use serde::Deserialize;
@@ -88,6 +88,10 @@ struct Cli {
     #[arg(value_name = "PATH", default_value = ".")]
     path: PathBuf,
 
+    /// Generate a message for amending the current HEAD commit.
+    #[arg(long)]
+    amend: bool,
+
     /// Ollama model to use (e.g. "gemma4:e2b", "qwen3.5:4b", "qwen3:4b-instruct", "mistral:7b").
     #[arg(long, default_value = "qwen3.5:4b")]
     model: String,
@@ -126,6 +130,17 @@ struct Cli {
     /// Write the complete generated model context to this file.
     #[arg(long, value_name = "FILE")]
     context_file: Option<PathBuf>,
+}
+
+impl Cli {
+    /// The [`CommitMode`] derived from the argument `--amend`.
+    fn commit_mode(&self) -> CommitMode {
+        if self.amend {
+            CommitMode::Amend
+        } else {
+            CommitMode::Normal
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -247,31 +262,32 @@ struct Prompt {
 
 fn main() -> Result<()> {
     let args = Cli::parse();
-
     if !args.temperature.is_finite() || args.temperature < 0.0 {
         bail!(
             "temperature must be a finite, non-negative number, got {:?}",
             args.temperature
         );
     }
+    let mode = args.commit_mode();
 
     let prompt_token_budget = available_prompt_tokens(args.model_context, args.think.is_on())?;
 
     let repo = GitRepo::discover(&args.path)?;
-    let changes = repo.staged_changes()?;
+    let changes = repo.commit_changes(mode)?;
 
-    if changes.is_empty() {
+    if changes.is_empty() && !args.amend {
         bail!("no staged changes");
     }
 
-    let diff = String::from_utf8_lossy(&repo.staged_diff()?).into_owned();
-    let prompt = build_prompt(&repo, &changes, &diff, prompt_token_budget)?;
+    let diff = String::from_utf8_lossy(&repo.commit_diff(mode)?).into_owned();
+    let prompt = build_prompt(&repo, mode, &changes, &diff, prompt_token_budget)?;
 
     eprintln!(
-        "git-sight: {} staged file(s), ~{}/{} prompt tokens, {}",
+        "git-sight: {} file(s) in commit, ~{}/{} (~{:.0}%) prompt tokens used, {}",
         changes.len(),
         prompt.estimated_tokens,
         prompt_token_budget,
+        100.0 * prompt.estimated_tokens as f64 / prompt_token_budget as f64,
         args.model,
     );
 
@@ -313,14 +329,11 @@ fn main() -> Result<()> {
     )?;
 
     if let Some(actual) = response.prompt_eval_count {
-        eprintln!(
-            "git-sight: Ollama used {actual} prompt tokens (conservatively estimated ~{})",
-            prompt.estimated_tokens
-        );
+        eprintln!("git-sight: Ollama actually used {actual} prompt tokens");
     }
 
     eprintln!(
-        "git-sight: Ollama generated {} token(s), done reason: {:?}",
+        "git-sight: Ollama generated {} tokens, done reason: {:?}",
         response.eval_count.unwrap_or(0),
         response.done_reason,
     );
@@ -339,7 +352,7 @@ fn main() -> Result<()> {
     if content.is_empty() {
         bail!(
             "model returned an empty response \
-         (generated {} token(s), done reason: {:?}, thinking: {} bytes)",
+         (generated {} tokens, done reason: {:?}, thinking: {} bytes)",
             response.eval_count.unwrap_or(0),
             response.done_reason,
             response.message.thinking.as_deref().map_or(0, str::len),
@@ -421,14 +434,15 @@ fn available_prompt_tokens(model_context: u32, think: bool) -> Result<usize> {
 
 fn build_prompt(
     repo: &GitRepo,
+    mode: CommitMode,
     changes: &[StagedChange],
     diff: &str,
     prompt_token_budget: usize,
 ) -> Result<Prompt> {
     let branch = branch_text(repo)?;
-    let history = history_text(repo)?;
+    let history = history_text(repo, mode)?;
     let staged_files = status_text(changes);
-    let staged_diff_stat = repo.staged_diff_stat()?;
+    let staged_diff_stat = repo.commit_diff_stat(mode)?;
     let readme = readme(repo)?;
 
     // The complete staged diff is non-negotiable. First measure the prompt
@@ -536,8 +550,13 @@ fn branch_text(repo: &GitRepo) -> Result<String> {
     Ok(format!("(detached HEAD at {short_sha})"))
 }
 
-fn history_text(repo: &GitRepo) -> Result<String> {
-    let subjects = repo.recent_commit_subjects(RECENT_COMMITS)?;
+fn history_text(repo: &GitRepo, mode: CommitMode) -> Result<String> {
+    let skip = usize::from(mode == CommitMode::Amend);
+    let subjects = repo
+        .recent_commit_subjects(RECENT_COMMITS + skip)?
+        .into_iter()
+        .skip(skip)
+        .collect::<Vec<_>>();
 
     if subjects.is_empty() {
         Ok("(no commit history yet)".to_owned())

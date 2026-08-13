@@ -1,6 +1,6 @@
 use anyhow::{Context as _, Result};
 
-use crate::git::{GitRepo, repo::git_command_error, staged::StagedChange};
+use crate::git::{CommitMode, GitRepo, repo::git_command_error, staged::StagedChange};
 
 impl GitRepo {
     /// Returns the commit ID currently referenced by `HEAD`.
@@ -76,19 +76,28 @@ impl GitRepo {
     /// Copy detection is intentionally not enabled. Detecting copies from unchanged files requires Git's more
     /// expensive `--find-copies-harder` mode, while copy information is not currently important enough to justify that
     /// additional work.
-    pub fn staged_changes(&self) -> Result<Vec<StagedChange>> {
-        let output = self.run(&["diff", "--cached", "--name-status", "-z", "--find-renames"])?;
+    pub fn commit_changes(&self, mode: CommitMode) -> Result<Vec<StagedChange>> {
+        let output = self.run(&[
+            "diff",
+            "--cached",
+            "--name-status",
+            "-z",
+            "--find-renames",
+            mode.base(),
+        ])?;
 
         StagedChange::parse(&output)
     }
 
-    /// Returns the complete patch staged for the next commit.
+    /// Returns the complete patch that would be represented by the next commit.
+    ///
+    /// In amend mode, the patch includes both the current HEAD commit and any additionally staged changes.
     ///
     /// The result is returned as raw bytes because arbitrary file contents are not guaranteed to be valid UTF-8.
     ///
     /// External diff programs and text-conversion filters are disabled to keep the output deterministic
     /// and suitable for programmatic use.
-    pub fn staged_diff(&self) -> Result<Vec<u8>> {
+    pub fn commit_diff(&self, mode: CommitMode) -> Result<Vec<u8>> {
         self.run(&[
             "diff",
             "--cached",
@@ -98,14 +107,18 @@ impl GitRepo {
             "--default-prefix",
             "--unified=3",
             "--find-renames",
+            mode.base(),
         ])
     }
 
-    /// Returns a compact summary of the changes staged for the next commit.
+    /// Returns a compact summary of the changes that would be represented by the next commit.
+    ///
+    /// In amend mode, the summary includes both the current HEAD commit and any
+    /// additionally staged changes.
     ///
     /// The summary shows the relative size of each changed file and aggregate insertion/deletion counts.
     /// Output is bounded because the complete file list is provided separately as structured staged-change context.
-    pub fn staged_diff_stat(&self) -> Result<String> {
+    pub fn commit_diff_stat(&self, mode: CommitMode) -> Result<String> {
         self.text(&[
             "diff",
             "--cached",
@@ -114,6 +127,7 @@ impl GitRepo {
             "--no-textconv",
             "--no-color",
             "--find-renames",
+            mode.base(),
         ])
     }
 

@@ -7,5 +7,5 @@ mod commands;
 mod repo;
 mod staged;
 
-pub use repo::GitRepo;
+pub use repo::{CommitMode, GitRepo};
 pub use staged::{StagedChange, StagedChangeKind};
