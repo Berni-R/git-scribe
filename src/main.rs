@@ -167,6 +167,7 @@ struct CommitMessage {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum ChangeKind {
+    Feature,
     BehaviorChange,
     BugFix,
     Refactor,
@@ -210,6 +211,7 @@ impl CommitMessage {
                 "change_kind": {
                     "type": "string",
                     "enum": [
+                        "feature",
                         "behavior_change",
                         "bug_fix",
                         "refactor",
@@ -219,7 +221,7 @@ impl CommitMessage {
                         "configuration",
                         "mixed"
                     ],
-                    "description": "The best high-level classification of the staged changes as a whole."
+                    "description": "The best high-level classification of the commit as a whole. Use feature for a new capability; behavior_change for an intentional change to existing behavior; bug_fix for correcting unintended behavior; refactor for internal restructuring without an intentional change in behavior or capabilities; tests for primarily test changes; documentation for primarily documentation changes; tooling for changes to development, build, release, or repository tooling rather than product functionality; configuration for primarily configuration changes; mixed when no single category clearly dominates."
                 },
                 "confidence": {
                     "type": "string",
