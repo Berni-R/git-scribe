@@ -101,6 +101,22 @@ impl GitRepo {
         ])
     }
 
+    /// Returns a compact summary of the changes staged for the next commit.
+    ///
+    /// The summary shows the relative size of each changed file and aggregate insertion/deletion counts.
+    /// Output is bounded because the complete file list is provided separately as structured staged-change context.
+    pub fn staged_diff_stat(&self) -> Result<String> {
+        self.text(&[
+            "diff",
+            "--cached",
+            "--stat=100,70,30",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-color",
+            "--find-renames",
+        ])
+    }
+
     /// Returns up to `limit` recent commit subjects, newest first.
     ///
     /// Only the subject line of each commit message is returned.
@@ -113,5 +129,18 @@ impl GitRepo {
         let limit = limit.to_string();
         let output = self.text(&["log", "-n", &limit, "--format=%s", "HEAD"])?;
         Ok(output.lines().map(str::to_owned).collect())
+    }
+
+    /// Returns the contents of a file from the Git index.
+    ///
+    /// Returns `None` when `path` does not exist in the index.
+    pub fn index_file(&self, path: &str) -> Result<Option<Vec<u8>>> {
+        let listed = self.run(&["ls-files", "--cached", "-z", "--", path])?;
+        if listed.is_empty() {
+            return Ok(None);
+        }
+
+        let spec = format!(":{path}");
+        Ok(Some(self.run(&["show", &spec])?))
     }
 }

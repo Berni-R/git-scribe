@@ -24,6 +24,10 @@ pub enum Role {
 /// Defaults are chosen independently from Ollama's own defaults.
 #[derive(Debug, Clone, Serialize)]
 pub struct ModelOptions {
+    /// Random seed used for deterministic generation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seed: Option<i64>,
+
     /// Sampling temperature controlling output randomness.
     ///
     /// Lower values generally make output more deterministic.
@@ -122,6 +126,7 @@ impl Serialize for KeepAlive {
 impl Default for ModelOptions {
     fn default() -> Self {
         ModelOptions {
+            seed: None,
             temperature: Some(0.0),
             num_ctx: Some(16_384),
             num_predict: None,
