@@ -141,7 +141,7 @@ impl Client {
             stream: false,
             think: options.think,
             format: options.format.clone(),
-            keep_alive: options.keep_alive.clone(),
+            keep_alive: options.keep_alive,
         };
 
         let mut response = self

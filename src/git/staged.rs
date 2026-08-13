@@ -128,3 +128,36 @@ impl StagedChange {
         Ok(PathBuf::from(path))
     }
 }
+
+impl StagedChange {
+    /// Return a concise one-line summary of this staged change.
+    ///
+    /// The format resembles Git status output and includes the change kind and affected path,
+    /// plus the source path and similarity for renames.
+    pub fn summary_line(&self) -> String {
+        match &self.kind {
+            StagedChangeKind::Added => {
+                format!("A\t{}", self.path.display())
+            }
+            StagedChangeKind::Modified => {
+                format!("M\t{}", self.path.display())
+            }
+            StagedChangeKind::Deleted => {
+                format!("D\t{}", self.path.display())
+            }
+            StagedChangeKind::Renamed { from, similarity } => {
+                format!(
+                    "R{similarity}\t{} -> {}",
+                    from.display(),
+                    self.path.display()
+                )
+            }
+            StagedChangeKind::TypeChanged => {
+                format!("T\t{}", self.path.display())
+            }
+            StagedChangeKind::Unmerged => {
+                format!("U\t{}", self.path.display())
+            }
+        }
+    }
+}
