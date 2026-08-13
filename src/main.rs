@@ -5,10 +5,10 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, bail};
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 use git_sight::{
     git::{GitRepo, StagedChange, StagedChangeKind},
-    ollama::{self, ChatOptions, KeepAlive, Message, ModelOptions, Role, Think, ThinkLevel},
+    ollama::{self, ChatOptions, KeepAlive, Message, ModelOptions, Role, Think},
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -109,8 +109,8 @@ struct Cli {
     seed: Option<i64>,
 
     /// Whether and how strongly the model should use explicit thinking.
-    #[arg(long, value_enum, default_value = "off")]
-    think: ThinkArg,
+    #[arg(long, value_enum, default_value_t = Think::Off)]
+    think: Think,
 
     /// Keep the Ollama model alive after execution.
     ///
@@ -126,36 +126,6 @@ struct Cli {
     /// Write the complete generated model context to this file.
     #[arg(long, value_name = "FILE")]
     context_file: Option<PathBuf>,
-}
-
-// TODO: remove the duplication (and e.g. use this instread of / replace the current `Tink`).
-#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
-enum ThinkArg {
-    Off,
-    On,
-    Low,
-    Medium,
-    High,
-    Max,
-}
-
-impl ThinkArg {
-    pub fn is_on(&self) -> bool {
-        self != &Self::Off
-    }
-}
-
-impl From<ThinkArg> for Think {
-    fn from(value: ThinkArg) -> Self {
-        match value {
-            ThinkArg::Off => Think::Enabled(false),
-            ThinkArg::On => Think::Enabled(true),
-            ThinkArg::Low => Think::Level(ThinkLevel::Low),
-            ThinkArg::Medium => Think::Level(ThinkLevel::Medium),
-            ThinkArg::High => Think::Level(ThinkLevel::High),
-            ThinkArg::Max => Think::Level(ThinkLevel::Max),
-        }
-    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -335,7 +305,7 @@ fn main() -> Result<()> {
                 },
                 seed: args.seed,
             }),
-            think: Some(args.think.into()),
+            think: Some(args.think),
             format: Some(CommitMessage::schema()),
             keep_alive: args.keep_alive.map(KeepAlive::from),
             timeout: Some(Duration::from_mins(if args.think.is_on() { 5 } else { 1 })),

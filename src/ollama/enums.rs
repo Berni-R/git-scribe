@@ -3,7 +3,7 @@ use std::{num::NonZeroU64, time::Duration};
 use serde::Serialize;
 
 /// Role of a message in an Ollama chat conversation.
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
     /// Instructions that define the assistant's behavior or context.
@@ -48,20 +48,15 @@ pub struct ModelOptions {
 /// Controls whether and how a model exposes its reasoning output.
 ///
 /// Ollama accepts either a boolean or, for models supporting configurable reasoning effort, a [`ThinkLevel`].
-#[derive(Debug, Clone, Copy, Serialize)]
-#[serde(untagged)]
+#[derive(Debug, Default, Clone, Copy, clap::ValueEnum, PartialEq, Eq)]
 pub enum Think {
-    /// Enable or disable thinking.
-    Enabled(bool),
+    /// Turn thinking off by passing `false` to Ollama.
+    #[default]
+    Off,
 
-    /// Request a particular reasoning effort.
-    Level(ThinkLevel),
-}
+    /// Turn thinking on by passing `true` to Ollama.
+    On,
 
-/// Requested reasoning effort for models that support configurable thinking.
-#[derive(Debug, Clone, Copy, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ThinkLevel {
     /// Low reasoning effort.
     Low,
 
@@ -75,8 +70,31 @@ pub enum ThinkLevel {
     Max,
 }
 
+impl Think {
+    /// `true` if some level of thinking is turned on.
+    pub fn is_on(&self) -> bool {
+        self != &Self::Off
+    }
+}
+
+impl Serialize for Think {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Think::Off => serializer.serialize_bool(false),
+            Think::On => serializer.serialize_bool(true),
+            Think::Low => serializer.serialize_str("low"),
+            Think::Medium => serializer.serialize_str("medium"),
+            Think::High => serializer.serialize_str("high"),
+            Think::Max => serializer.serialize_str("max"),
+        }
+    }
+}
+
 /// Controls how long Ollama keeps a model loaded in memory after a request.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeepAlive {
     /// Keep the model loaded for the given positive number of seconds.
     ForSeconds(NonZeroU64),
@@ -134,21 +152,9 @@ impl Default for ModelOptions {
     }
 }
 
-impl Default for Think {
-    fn default() -> Self {
-        Self::Enabled(false)
-    }
-}
-
 impl From<bool> for Think {
     fn from(value: bool) -> Self {
-        Self::Enabled(value)
-    }
-}
-
-impl From<ThinkLevel> for Think {
-    fn from(level: ThinkLevel) -> Self {
-        Self::Level(level)
+        if value { Self::On } else { Self::Off }
     }
 }
 
