@@ -182,7 +182,6 @@ impl ProspectiveCommit {
     }
 
     pub(super) fn into_patch(self) -> Vec<u8> {
-        // TODO: implement `Into` trait?!
         self.patch
     }
 }

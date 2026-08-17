@@ -67,6 +67,7 @@ impl GitRepo {
         &self.root
     }
 
+    /// Return the underlying libgit2 repository for use within the Git abstraction.
     pub(super) fn repository(&self) -> &Repository {
         &self.repository
     }

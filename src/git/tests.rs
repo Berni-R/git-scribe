@@ -209,6 +209,68 @@ fn normal_modification_has_versions_and_zero_context_hunk() -> Result<()> {
 }
 
 #[test]
+fn prospective_commit_ignores_worktree_only_changes() -> Result<()> {
+    let fixture = Fixture::new()?;
+    fixture.write_and_stage("tracked.txt", "indexed\n")?;
+    fixture.commit("initial")?;
+
+    fixture.write("tracked.txt", "unstaged tracked edit\n")?;
+    fixture.write("untracked.txt", "unstaged untracked file\n")?;
+
+    let repo = fixture.git_repo()?;
+    let commit = repo.prospective_commit(CommitMode::Normal)?;
+
+    assert!(repo.is_dirty()?);
+    assert!(commit.is_empty());
+    assert!(commit.patch().is_empty());
+    assert_eq!(
+        commit.stats(),
+        CommitStats {
+            files_changed: 0,
+            insertions: 0,
+            deletions: 0,
+        }
+    );
+    Ok(())
+}
+
+#[test]
+fn prospective_commit_reads_index_not_worktree() -> Result<()> {
+    let fixture = Fixture::new()?;
+    fixture.write_and_stage("file.txt", "base\n")?;
+    fixture.commit("initial")?;
+
+    fixture.write_and_stage("file.txt", "staged\n")?;
+    fixture.write("file.txt", "unstaged later edit\n")?;
+
+    let repo = fixture.git_repo()?;
+    let commit = repo.prospective_commit(CommitMode::Normal)?;
+    let change = only_change(&commit);
+    let CommitChangeKind::Modified { before, after } = &change.kind else {
+        panic!("expected a modification, got {:?}", change.kind);
+    };
+
+    assert_eq!(repo.blob(before.oid)?, b"base\n");
+    assert_eq!(repo.blob(after.oid)?, b"staged\n");
+    assert_eq!(
+        repo.index_file("file.txt")?.as_deref(),
+        Some(b"staged\n".as_slice())
+    );
+    assert_eq!(
+        change.hunks,
+        [DiffHunk {
+            before: Some(LineRange { start: 1, count: 1 }),
+            after: Some(LineRange { start: 1, count: 1 }),
+        }]
+    );
+
+    let patch = String::from_utf8(commit.patch().to_vec())?;
+    assert!(patch.contains("-base\n+staged\n"));
+    assert!(!patch.contains("unstaged later edit"));
+    Ok(())
+}
+
+#[test]
 fn deletion_has_only_before_version() -> Result<()> {
     let fixture = Fixture::new()?;
     fixture.write_and_stage("deleted.txt", "one\ntwo\n")?;
@@ -365,10 +427,7 @@ fn detached_head_has_no_current_branch() -> Result<()> {
     let repo = fixture.git_repo()?;
 
     assert_eq!(repo.current_branch()?, None);
-    assert_eq!(
-        repo.head_sha()?.as_deref(),
-        Some(head.to_string()).as_deref()
-    );
+    assert_eq!(repo.head_sha()?, Some(head));
     assert_eq!(repo.recent_commit_subjects(1)?, ["root"]);
     Ok(())
 }

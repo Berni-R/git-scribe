@@ -32,7 +32,7 @@ const RECENT_COMMITS: usize = 12;
 const ESTIMATED_BYTES_PER_TOKEN: f64 = 3.3;
 
 /// Maximum amount of README text included as supporting repository context.
-const MAX_README_CONTEXT_TOKENS: usize = 1_500; // TODO: make README budget relative to total budget?
+const MAX_README_CONTEXT_TOKENS: usize = 1_500;
 
 /// Context capacity deliberately left unused by our raw-message budget.
 ///

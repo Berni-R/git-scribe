@@ -28,7 +28,6 @@ pub fn context_for_change(repo: &GitRepo, change: &CommitChange) -> Result<Vec<S
         },
     };
     if !version.is_blob() {
-        // TODO: add some warning, `Err` result, or other kind of feedback?
         return Ok(Vec::new());
     }
 

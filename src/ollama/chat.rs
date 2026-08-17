@@ -27,7 +27,6 @@ struct ChatRequest {
     pub messages: Vec<Message>,
 
     // TODO: add `tools: object[]` -- Optional list of function tools the model may call during the chat
-    // TODO: add `format: enum<string> | object[]` -- Format to return a response in. Can be json or a JSON schema.
     /// Runtime options that control text generation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub options: Option<ModelOptions>,
@@ -117,7 +116,6 @@ pub struct ResponseMessage {
     #[serde(default)]
     pub thinking: Option<String>,
     // TODO: add `tool_calls: object[]` -- Tool calls requested by the assistant.
-    // TODO: add `images: string[]` -- Optional list of inline images for multimodal models. (Base64-encoded image content.)
 }
 
 impl Client {

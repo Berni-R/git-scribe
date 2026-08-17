@@ -12,9 +12,9 @@ use crate::git::{
 };
 
 impl GitRepo {
-    /// Return the commit ID referenced by HEAD, or None for an unborn repository.
-    pub fn head_sha(&self) -> Result<Option<String>> {
-        Ok(self.head_commit()?.map(|commit| commit.id().to_string()))
+    /// Return the object ID referenced by HEAD, or None for an unborn repository.
+    pub fn head_sha(&self) -> Result<Option<Oid>> {
+        Ok(self.head_commit()?.map(|commit| commit.id()))
     }
 
     /// Return the checked-out local branch, or None for detached HEAD.

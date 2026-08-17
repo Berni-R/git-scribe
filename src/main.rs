@@ -18,7 +18,7 @@ mod cli;
 /// A commit message should be much shorter than this, but the schema permits a 100-character subject,
 /// a body of up to 700 characters, and a few small classification fields.
 /// 384 leaves enough room for that worst case without reserving a significant fraction of a typical 16k model context.
-const NUM_PREDICT: i32 = 384; // TODO: should we even limit this?
+const NUM_PREDICT: i32 = 384;
 
 /// Minimum context reserved for model reasoning and the final response when generation itself is not capped.
 const THINKING_CONTEXT_RESERVE: u32 = 4_096;
