@@ -38,17 +38,17 @@ fn main() -> Result<()> {
     let prompt_token_budget = Prompt::available_tokens(args.model_context, predict_reserve)?;
 
     let repo = GitRepo::discover(&args.path)?;
-    let changes = repo.commit_changes(mode)?;
+    let commit = repo.prospective_commit(mode)?;
 
-    if changes.is_empty() && !args.amend {
+    if commit.is_empty() && !args.amend {
         bail!("no staged changes");
     }
 
-    let prompt = Prompt::new(&repo, &args.context, mode, &changes, prompt_token_budget)?;
+    let prompt = Prompt::new(&repo, &args.context, &commit, prompt_token_budget)?;
 
     eprintln!(
         "git-sight: {} file(s) in commit, ~{}/{} (~{:.0}%) prompt tokens used, {}",
-        changes.len(),
+        commit.len(),
         prompt.estimated_tokens,
         prompt_token_budget,
         100.0 * prompt.estimated_tokens as f64 / prompt_token_budget as f64,
@@ -88,7 +88,7 @@ fn main() -> Result<()> {
             think: Some(args.think),
             format: Some(CommitMessage::schema()),
             keep_alive: args.keep_alive.map(KeepAlive::from),
-            timeout: Some(Duration::from_mins(if args.think.is_on() { 5 } else { 1 })),
+            timeout: Some(Duration::from_mins(if args.think.is_on() { 5 } else { 3 })),
         },
     )?;
 

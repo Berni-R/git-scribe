@@ -1,0 +1,452 @@
+use std::{
+    fmt::Write as _,
+    fs,
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+};
+
+use anyhow::{Context as _, Result};
+use git2::{ErrorCode, FileMode, Oid, Repository, Signature};
+
+use super::*;
+
+static NEXT_REPOSITORY: AtomicU64 = AtomicU64::new(0);
+
+struct Fixture {
+    path: PathBuf,
+    repository: Repository,
+}
+
+impl Fixture {
+    fn new() -> Result<Self> {
+        let sequence = NEXT_REPOSITORY.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("git-sight-test-{}-{sequence}", std::process::id()));
+        fs::create_dir(&path)?;
+        let repository = Repository::init(&path)?;
+        repository.set_head("refs/heads/main")?;
+        Ok(Self { path, repository })
+    }
+
+    fn git_repo(&self) -> Result<GitRepo> {
+        GitRepo::discover(&self.path)
+    }
+
+    fn write(&self, path: &str, contents: impl AsRef<[u8]>) -> Result<()> {
+        let path = self.path.join(path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(path, contents)?;
+        Ok(())
+    }
+
+    fn stage(&self, path: &str) -> Result<()> {
+        let mut index = self.repository.index()?;
+        index.add_path(Path::new(path))?;
+        index.write()?;
+        Ok(())
+    }
+
+    fn write_and_stage(&self, path: &str, contents: impl AsRef<[u8]>) -> Result<()> {
+        self.write(path, contents)?;
+        self.stage(path)
+    }
+
+    fn delete_and_stage(&self, path: &str) -> Result<()> {
+        fs::remove_file(self.path.join(path))?;
+        let mut index = self.repository.index()?;
+        index.remove_path(Path::new(path))?;
+        index.write()?;
+        Ok(())
+    }
+
+    fn rename_and_stage(&self, from: &str, to: &str) -> Result<()> {
+        fs::rename(self.path.join(from), self.path.join(to))?;
+        let mut index = self.repository.index()?;
+        index.remove_path(Path::new(from))?;
+        index.add_path(Path::new(to))?;
+        index.write()?;
+        Ok(())
+    }
+
+    fn commit(&self, message: &str) -> Result<Oid> {
+        let parents = match self.repository.head() {
+            Ok(head) => vec![head.peel_to_commit()?.id()],
+            Err(error) if error.code() == ErrorCode::UnbornBranch => Vec::new(),
+            Err(error) => return Err(error).context("failed to read fixture HEAD"),
+        };
+        self.commit_with_parents(message, &parents, true)
+    }
+
+    fn commit_with_parents(
+        &self,
+        message: &str,
+        parent_ids: &[Oid],
+        update_head: bool,
+    ) -> Result<Oid> {
+        let tree_id = self.repository.index()?.write_tree()?;
+        let tree = self.repository.find_tree(tree_id)?;
+        let signature = Signature::now("Git Sight Tests", "tests@example.com")?;
+        let parents = parent_ids
+            .iter()
+            .map(|id| self.repository.find_commit(*id))
+            .collect::<Result<Vec<_>, _>>()?;
+        let parent_refs = parents.iter().collect::<Vec<_>>();
+
+        Ok(self.repository.commit(
+            update_head.then_some("HEAD"),
+            &signature,
+            &signature,
+            message,
+            &tree,
+            &parent_refs,
+        )?)
+    }
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        if let Err(error) = fs::remove_dir_all(&self.path) {
+            eprintln!("failed to remove test repository: {error}");
+        }
+    }
+}
+
+fn only_change(commit: &ProspectiveCommit) -> &CommitChange {
+    assert_eq!(commit.len(), 1);
+    &commit.changes()[0]
+}
+
+fn numbered_lines(count: usize) -> String {
+    (1..=count).fold(String::new(), |mut lines, line| {
+        writeln!(lines, "line {line}").expect("writing to a String cannot fail");
+        lines
+    })
+}
+
+#[test]
+fn unborn_repository_uses_empty_tree() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let nested = fixture.path.join("nested");
+    fs::create_dir(&nested)?;
+    fixture.write_and_stage("new.rs", "fn main() {}\n")?;
+    let repo = GitRepo::discover(&nested)?;
+
+    assert_eq!(repo.root(), fixture.path.canonicalize()?);
+    assert_eq!(repo.current_branch()?.as_deref(), Some("main"));
+    assert_eq!(repo.head_sha()?, None);
+    assert!(repo.is_dirty()?);
+    assert_eq!(
+        repo.index_file("new.rs")?.as_deref(),
+        Some(b"fn main() {}\n".as_slice())
+    );
+
+    let commit = repo.prospective_commit(CommitMode::Normal)?;
+    let change = only_change(&commit);
+    let CommitChangeKind::Added { after } = &change.kind else {
+        panic!("expected an addition, got {:?}", change.kind);
+    };
+    assert_eq!(after.path, Path::new("new.rs"));
+    assert_eq!(repo.blob(after.oid)?, b"fn main() {}\n");
+    assert_eq!(
+        change.hunks,
+        [DiffHunk {
+            before: None,
+            after: Some(LineRange { start: 1, count: 1 }),
+        }]
+    );
+    assert_eq!(
+        commit.stats(),
+        CommitStats {
+            files_changed: 1,
+            insertions: 1,
+            deletions: 0,
+        }
+    );
+    assert_eq!(
+        commit.stats().to_string(),
+        "1 file changed, 1 insertion(+), 0 deletions(-)"
+    );
+    let patch = String::from_utf8(commit.patch().to_vec())?;
+    assert!(patch.contains("diff --git a/new.rs b/new.rs"));
+    assert!(patch.contains("@@ -0,0 +1 @@"));
+    assert!(
+        repo.prospective_commit(CommitMode::Amend)
+            .unwrap_err()
+            .to_string()
+            .contains("no existing commit")
+    );
+    Ok(())
+}
+
+#[test]
+fn normal_modification_has_versions_and_zero_context_hunk() -> Result<()> {
+    let fixture = Fixture::new()?;
+    fixture.write_and_stage("file.txt", "one\ntwo\nthree\n")?;
+    fixture.commit("initial")?;
+    fixture.write_and_stage("file.txt", "one\nsecond\nextra\nthree\n")?;
+    let repo = fixture.git_repo()?;
+
+    let commit = repo.prospective_commit(CommitMode::Normal)?;
+    let change = only_change(&commit);
+    let CommitChangeKind::Modified { before, after } = &change.kind else {
+        panic!("expected a modification, got {:?}", change.kind);
+    };
+    assert_eq!(before.path, after.path);
+    assert_ne!(before.oid, after.oid);
+    assert_eq!(repo.blob(before.oid)?, b"one\ntwo\nthree\n");
+    assert_eq!(repo.blob(after.oid)?, b"one\nsecond\nextra\nthree\n");
+    assert_eq!(
+        change.hunks,
+        [DiffHunk {
+            before: Some(LineRange { start: 2, count: 1 }),
+            after: Some(LineRange { start: 2, count: 2 }),
+        }]
+    );
+    assert!(String::from_utf8(commit.patch().to_vec())?.contains("-two\n+second\n+extra\n"));
+    Ok(())
+}
+
+#[test]
+fn deletion_has_only_before_version() -> Result<()> {
+    let fixture = Fixture::new()?;
+    fixture.write_and_stage("deleted.txt", "one\ntwo\n")?;
+    fixture.commit("initial")?;
+    fixture.delete_and_stage("deleted.txt")?;
+    let repo = fixture.git_repo()?;
+
+    let commit = repo.prospective_commit(CommitMode::Normal)?;
+    let change = only_change(&commit);
+    let CommitChangeKind::Deleted { before } = &change.kind else {
+        panic!("expected a deletion, got {:?}", change.kind);
+    };
+    assert_eq!(before.path, Path::new("deleted.txt"));
+    assert_eq!(repo.blob(before.oid)?, b"one\ntwo\n");
+    assert_eq!(
+        change.hunks,
+        [DiffHunk {
+            before: Some(LineRange { start: 1, count: 2 }),
+            after: None,
+        }]
+    );
+    Ok(())
+}
+
+#[test]
+fn pure_rename_preserves_both_versions() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let contents = numbered_lines(20);
+    fixture.write_and_stage("before.txt", &contents)?;
+    fixture.commit("initial")?;
+    fixture.rename_and_stage("before.txt", "after.txt")?;
+    let repo = fixture.git_repo()?;
+
+    let commit = repo.prospective_commit(CommitMode::Normal)?;
+    let change = only_change(&commit);
+    let CommitChangeKind::Renamed { before, after } = &change.kind else {
+        panic!("expected a rename, got {:?}", change.kind);
+    };
+    assert_eq!(before.path, Path::new("before.txt"));
+    assert_eq!(after.path, Path::new("after.txt"));
+    assert_eq!(before.oid, after.oid);
+    assert!(change.hunks.is_empty());
+    assert_eq!(change.summary_line(), "R\tbefore.txt -> after.txt");
+    Ok(())
+}
+
+#[test]
+fn rename_with_edit_is_one_change_with_only_edit_hunk() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let before = numbered_lines(30);
+    fixture.write_and_stage("before.rs", &before)?;
+    fixture.commit("initial")?;
+    fixture.rename_and_stage("before.rs", "after.rs")?;
+    let after = before.replace("line 15\n", "changed 15\n");
+    fixture.write_and_stage("after.rs", &after)?;
+    let repo = fixture.git_repo()?;
+
+    let commit = repo.prospective_commit(CommitMode::Normal)?;
+    let change = only_change(&commit);
+    let CommitChangeKind::Renamed {
+        before: old,
+        after: new,
+    } = &change.kind
+    else {
+        panic!("expected a rename with edits, got {:?}", change.kind);
+    };
+    assert_eq!(old.path, Path::new("before.rs"));
+    assert_eq!(new.path, Path::new("after.rs"));
+    assert_ne!(old.oid, new.oid);
+    assert_eq!(
+        change.hunks,
+        [DiffHunk {
+            before: Some(LineRange {
+                start: 15,
+                count: 1,
+            }),
+            after: Some(LineRange {
+                start: 15,
+                count: 1,
+            }),
+        }]
+    );
+    Ok(())
+}
+
+#[test]
+fn root_commit_amend_uses_empty_tree() -> Result<()> {
+    let fixture = Fixture::new()?;
+    fixture.write_and_stage("root.txt", "original\n")?;
+    fixture.commit("root")?;
+    fixture.write_and_stage("root.txt", "replacement\n")?;
+    let repo = fixture.git_repo()?;
+
+    let commit = repo.prospective_commit(CommitMode::Amend)?;
+    let change = only_change(&commit);
+    let CommitChangeKind::Added { after } = &change.kind else {
+        panic!(
+            "expected root amend to add the index tree, got {:?}",
+            change.kind
+        );
+    };
+    assert_eq!(repo.blob(after.oid)?, b"replacement\n");
+    assert_eq!(change.hunks[0].before, None);
+    Ok(())
+}
+
+#[test]
+fn ordinary_amend_uses_parent_tree() -> Result<()> {
+    let fixture = Fixture::new()?;
+    fixture.write_and_stage("file.txt", "base\n")?;
+    fixture.commit("base")?;
+    fixture.write_and_stage("file.txt", "head\n")?;
+    fixture.commit("head")?;
+    fixture.write_and_stage("file.txt", "amended\n")?;
+    let repo = fixture.git_repo()?;
+
+    let amended = repo.prospective_commit(CommitMode::Amend)?;
+    let CommitChangeKind::Modified { before, after } = &only_change(&amended).kind else {
+        panic!("expected an amended modification");
+    };
+    assert_eq!(repo.blob(before.oid)?, b"base\n");
+    assert_eq!(repo.blob(after.oid)?, b"amended\n");
+
+    let normal = repo.prospective_commit(CommitMode::Normal)?;
+    let CommitChangeKind::Modified { before, .. } = &only_change(&normal).kind else {
+        panic!("expected a normal modification");
+    };
+    assert_eq!(repo.blob(before.oid)?, b"head\n");
+    Ok(())
+}
+
+#[test]
+fn merge_commit_amend_is_rejected() -> Result<()> {
+    let fixture = Fixture::new()?;
+    fixture.write_and_stage("file.txt", "contents\n")?;
+    let root = fixture.commit("root")?;
+    let main = fixture.commit_with_parents("main", &[root], true)?;
+    let side = fixture.commit_with_parents("side", &[root], false)?;
+    fixture.commit_with_parents("merge", &[main, side], true)?;
+    let repo = fixture.git_repo()?;
+
+    let error = repo.prospective_commit(CommitMode::Amend).unwrap_err();
+    assert!(error.to_string().contains("cannot amend merge commit"));
+    assert!(error.to_string().contains("2 parents"));
+    Ok(())
+}
+
+#[test]
+fn detached_head_has_no_current_branch() -> Result<()> {
+    let fixture = Fixture::new()?;
+    fixture.write_and_stage("file.txt", "contents\n")?;
+    let head = fixture.commit("root")?;
+    fixture.repository.set_head_detached(head)?;
+    let repo = fixture.git_repo()?;
+
+    assert_eq!(repo.current_branch()?, None);
+    assert_eq!(
+        repo.head_sha()?.as_deref(),
+        Some(head.to_string()).as_deref()
+    );
+    assert_eq!(repo.recent_commit_subjects(1)?, ["root"]);
+    Ok(())
+}
+
+#[test]
+fn pathspec_characters_are_literal_paths() -> Result<()> {
+    let fixture = Fixture::new()?;
+    for path in ["literal*.rs", "question?.rs", "[bracket].rs"] {
+        fixture.write_and_stage(path, "fn changed() {}\n")?;
+    }
+    let repo = fixture.git_repo()?;
+
+    let commit = repo.prospective_commit(CommitMode::Normal)?;
+    let mut paths = commit
+        .changes()
+        .iter()
+        .map(|change| {
+            change
+                .after()
+                .expect("addition has after version")
+                .path
+                .clone()
+        })
+        .collect::<Vec<_>>();
+    paths.sort();
+    assert_eq!(
+        paths,
+        [
+            PathBuf::from("[bracket].rs"),
+            PathBuf::from("literal*.rs"),
+            PathBuf::from("question?.rs"),
+        ]
+    );
+    assert!(commit.changes().iter().all(|change| {
+        change.hunks
+            == [DiffHunk {
+                before: None,
+                after: Some(LineRange { start: 1, count: 1 }),
+            }]
+    }));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn symbolic_link_change_is_a_type_change() -> Result<()> {
+    use std::os::unix::fs::symlink;
+
+    let fixture = Fixture::new()?;
+    fixture.write_and_stage("entry", "regular contents\n")?;
+    fixture.commit("regular")?;
+    fs::remove_file(fixture.path.join("entry"))?;
+    symlink("target", fixture.path.join("entry"))?;
+    fixture.stage("entry")?;
+    let repo = fixture.git_repo()?;
+
+    let commit = repo.prospective_commit(CommitMode::Normal)?;
+    let CommitChangeKind::TypeChanged { before, after } = &only_change(&commit).kind else {
+        panic!("expected a type change");
+    };
+    assert_eq!(before.mode, FileMode::Blob);
+    assert_eq!(after.mode, FileMode::Link);
+    assert_eq!(repo.blob(after.oid)?, b"target");
+    Ok(())
+}
+
+#[test]
+fn syntax_context_consumes_owned_change_data() -> Result<()> {
+    let fixture = Fixture::new()?;
+    fixture.write_and_stage("source.rs", "fn changed() {\n    let value = 1;\n}\n")?;
+    fixture.commit("initial")?;
+    fixture.write_and_stage("source.rs", "fn changed() {\n    let value = 2;\n}\n")?;
+    let repo = fixture.git_repo()?;
+    let commit = repo.prospective_commit(CommitMode::Normal)?;
+
+    let context = crate::syntax::context_for_change(&repo, only_change(&commit))?;
+    assert_eq!(context.len(), 1);
+    assert!(context[0].contains("hunk at line 2"));
+    assert!(context[0].contains("function_item changed"));
+    Ok(())
+}

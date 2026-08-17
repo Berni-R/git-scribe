@@ -4,7 +4,7 @@ use anyhow::{Context as _, Result, bail};
 
 use crate::{
     GitRepo,
-    git::{CommitMode, StagedChange},
+    git::{CommitChange, CommitMode, ProspectiveCommit},
 };
 
 /// Model context for commit-message generation together with its estimated token cost.
@@ -75,32 +75,31 @@ that is fully supported.
 - Do not mention the model or prompt.
 "#;
 
-    /// Build model context for the commit represented by `mode` within the given token budget.
+    /// Build model context for `commit` within the given token budget.
     ///
     /// The complete commit diff and required metadata are always retained;
     /// README context is clipped as necessary.
-    /// Returns an error if the required context alone exceeds the budget or a `git` command fails.
+    /// Returns an error if the required context alone exceeds the budget or repository context cannot be read.
     pub fn new(
         repo: &GitRepo,
         context: &[String],
-        mode: CommitMode,
-        changes: &[StagedChange],
+        commit: &ProspectiveCommit,
         token_budget: usize,
     ) -> Result<Self> {
         let branch = branch_text(repo)?;
-        let history = commit_history_text(repo, mode)?;
-        let staged_files = file_change_status_text(changes);
-        let staged_diff_stat = repo.commit_diff_stat(mode)?;
-        let diff = String::from_utf8_lossy(&repo.commit_diff(mode)?).into_owned();
+        let history = commit_history_text(repo, commit.mode())?;
+        let commit_files = file_change_status_text(commit.changes());
+        let commit_stats = commit.stats().to_string();
+        let diff = String::from_utf8_lossy(commit.patch()).into_owned();
 
-        // The complete staged diff is non-negotiable.
+        // The complete prospective-commit diff is non-negotiable.
         // First measure the prompt with README contents omitted.
         // If this alone does not fit, the commit should be split rather than silently dropping part of the diff.
         let minimal = render_prompt(
             &branch,
             &history,
-            &staged_files,
-            &staged_diff_stat,
+            &commit_files,
+            &commit_stats,
             "(README omitted)",
             context,
             &diff,
@@ -125,8 +124,8 @@ that is fully supported.
         let text = render_prompt(
             &branch,
             &history,
-            &staged_files,
-            &staged_diff_stat,
+            &commit_files,
+            &commit_stats,
             &readme,
             context,
             &diff,
@@ -183,8 +182,8 @@ that is fully supported.
 fn render_prompt(
     branch: &str,
     history: &str,
-    staged_files: &str,
-    staged_diff_stat: &str,
+    commit_files: &str,
+    commit_stats: &str,
     readme: &str,
     context: &[String],
     diff: &str,
@@ -216,10 +215,10 @@ fn render_prompt(
 {history}
 
 ## Commit changes summary
-{staged_diff_stat}
+{commit_stats}
 
 ## Files in commit
-{staged_files}
+{commit_files}
 
 ## Root README.md from the Git index
 ````markdown
@@ -259,10 +258,10 @@ fn commit_history_text(repo: &GitRepo, mode: CommitMode) -> Result<String> {
 }
 
 /// Return newline-separated summaries of the files changed by the commit.
-fn file_change_status_text(changes: &[StagedChange]) -> String {
+fn file_change_status_text(changes: &[CommitChange]) -> String {
     changes
         .iter()
-        .map(StagedChange::summary_line)
+        .map(CommitChange::summary_line)
         .collect::<Vec<_>>()
         .join("\n")
 }

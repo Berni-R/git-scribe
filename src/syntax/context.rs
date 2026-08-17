@@ -3,12 +3,52 @@ use std::collections::HashSet;
 use anyhow::{Context as _, Result};
 use tree_sitter::{Node, Parser, Point};
 
+use crate::{
+    GitRepo,
+    git::{CommitChange, DiffHunk},
+};
+
 use super::Language;
 
 const MAX_ENCLOSING_LINES: usize = 100;
 const MAX_AST_DEPTH: usize = 8;
 const MAX_FULL_EXCERPT_LINES: usize = 36;
 const MAX_EXCERPT_BYTES: usize = 5_000;
+
+/// Extract Tree-sitter context for one owned prospective-commit change.
+///
+/// The after version is analyzed when present; deletions use the before version.
+/// Non-blob entries and files with unsupported languages produce no context.
+pub fn context_for_change(repo: &GitRepo, change: &CommitChange) -> Result<Vec<String>> {
+    let (version, after) = match change.after() {
+        Some(version) => (version, true),
+        None => match change.before() {
+            Some(version) => (version, false),
+            None => return Ok(Vec::new()),
+        },
+    };
+    if !version.is_blob() {
+        // TODO: add some warning, `Err` result, or other kind of feedback?
+        return Ok(Vec::new());
+    }
+
+    let source = repo.blob(version.oid)?;
+    let Some(language) = Language::detect(&version.path, &source) else {
+        return Ok(Vec::new());
+    };
+    let ranges = change
+        .hunks
+        .iter()
+        .filter_map(|hunk| selected_range(hunk, after))
+        .map(|range| (range.start, range.count))
+        .collect::<Vec<_>>();
+
+    context_for_ranges(&source, language, &ranges)
+}
+
+fn selected_range(hunk: &DiffHunk, after: bool) -> Option<crate::git::LineRange> {
+    if after { hunk.after } else { hunk.before }
+}
 
 /// Extract Tree-sitter context around changed source ranges.
 ///

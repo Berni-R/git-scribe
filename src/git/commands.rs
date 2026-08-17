@@ -1,226 +1,278 @@
-use std::{ffi::OsString, path::Path};
+use std::path::Path;
 
-use anyhow::{Context as _, Result};
+use anyhow::{Context as _, Result, bail};
+use git2::{
+    Delta, Diff, DiffDelta, DiffFile, DiffFindOptions, DiffFormat, DiffOptions, Oid, Patch, Sort,
+    StatusOptions,
+};
 
 use crate::git::{
-    CommitMode, DiffHunk, GitRepo, parse_hunks, repo::git_command_error, staged::StagedChange,
+    CommitChange, CommitChangeKind, CommitMode, CommitStats, DiffHunk, FileVersion, GitRepo,
+    LineRange, ProspectiveCommit,
 };
 
 impl GitRepo {
-    /// Returns the commit ID currently referenced by `HEAD`.
-    ///
-    /// Returns `None` when the repository has no commits yet,
-    /// such as a freshly initialized repository with an unborn branch.
-    ///
-    /// Returns an error if Git cannot be executed, `HEAD` cannot be inspected, or Git returns unexpected output.
+    /// Return the commit ID referenced by HEAD, or None for an unborn repository.
     pub fn head_sha(&self) -> Result<Option<String>> {
-        let args = ["rev-parse", "--verify", "--quiet", "HEAD^{commit}"];
-        let output = self.execute(&args)?;
-        if output.status.success() {
-            let sha =
-                String::from_utf8(output.stdout).context("Git HEAD SHA is not valid UTF-8")?;
-
-            return Ok(Some(sha.trim_end_matches(['\r', '\n']).to_owned()));
-        }
-
-        // An unborn branch still has a symbolic HEAD, but that symbolic ref does not resolve to a commit yet.
-        let head = self.execute(&["symbolic-ref", "--quiet", "HEAD"])?;
-        if head.status.success() {
-            return Ok(None);
-        }
-        Err(git_command_error(self.root(), &args, None, &output))
+        Ok(self.head_commit()?.map(|commit| commit.id().to_string()))
     }
 
-    /// Returns the name of the currently checked-out branch.
+    /// Return the checked-out local branch, or None for detached HEAD.
     ///
-    /// Returns `None` when the repository is in detached-HEAD state.
-    ///
-    /// An unborn repository may still return a branch name because `HEAD` already points to that branch
-    /// even though the branch has no commits.
+    /// Symbolic references outside refs/heads are not reported as local branches.
     pub fn current_branch(&self) -> Result<Option<String>> {
-        let args = ["symbolic-ref", "--quiet", "--short", "HEAD"];
-        let output = self.execute(&args)?;
-        match output.status.code() {
-            Some(0) => {
-                let branch = String::from_utf8(output.stdout)
-                    .context("Git branch name is not valid UTF-8")?;
-                Ok(Some(branch.trim_end_matches(['\r', '\n']).to_owned()))
-            }
+        let head = self
+            .repository()
+            .find_reference("HEAD")
+            .context("failed to read Git HEAD")?;
+        let Some(target) = head.symbolic_target_bytes() else {
+            return Ok(None);
+        };
+        let Some(branch) = target.strip_prefix(b"refs/heads/") else {
+            return Ok(None);
+        };
+        let branch = std::str::from_utf8(branch).context("Git branch name is not valid UTF-8")?;
 
-            // `git symbolic-ref --quiet` returns exit status 1 when the requested ref is not symbolic,
-            // which is the normal detached HEAD case.
-            Some(1) => Ok(None),
-
-            _ => Err(git_command_error(self.root(), &args, None, &output)),
-        }
+        Ok(Some(branch.to_owned()))
     }
 
-    /// Returns whether the repository has staged, unstaged, or untracked changes.
+    /// Return whether the index or working tree contains tracked or untracked changes.
     ///
-    /// Ignored files are not considered dirty.
-    ///
-    /// This explicitly enables normal untracked-file reporting so that the result is not affected by the user's
-    /// `status.showUntrackedFiles` configuration.
+    /// Ignored files are excluded. Untracked directories use normal, non-recursive status behavior.
     pub fn is_dirty(&self) -> Result<bool> {
-        let output = self.run(
-            &["status", "--porcelain=v1", "--untracked-files=normal", "-z"],
-            None,
-        )?;
-        Ok(!output.is_empty())
+        let mut options = StatusOptions::new();
+        options
+            .include_untracked(true)
+            .include_ignored(false)
+            .recurse_untracked_dirs(false);
+
+        let statuses = self
+            .repository()
+            .statuses(Some(&mut options))
+            .context("failed to read Git status")?;
+        Ok(!statuses.is_empty())
     }
 
-    /// Returns structured information about changes staged for the next commit.
-    ///
-    /// Rename detection is enabled explicitly so that related delete/add operations can be represented as renames
-    /// when Git detects sufficient similarity.
-    ///
-    /// Copy detection is intentionally not enabled. Detecting copies from unchanged files requires Git's more
-    /// expensive `--find-copies-harder` mode, while copy information is not currently important enough to justify that
-    /// additional work.
-    pub fn commit_changes(&self, mode: CommitMode) -> Result<Vec<StagedChange>> {
-        let output = self.run(
-            &[
-                "diff",
-                "--cached",
-                "--name-status",
-                "-z",
-                "--find-renames",
-                mode.base(),
-            ],
-            None,
-        )?;
+    /// Build all views of the commit currently represented by the index from one tree-to-index diff.
+    pub fn prospective_commit(&self, mode: CommitMode) -> Result<ProspectiveCommit> {
+        let diff = self.prospective_diff(mode)?;
+        let changes = commit_changes(&diff)?;
+        let raw_stats = diff
+            .stats()
+            .context("failed to calculate prospective commit statistics")?;
+        let stats = CommitStats {
+            files_changed: raw_stats.files_changed(),
+            insertions: raw_stats.insertions(),
+            deletions: raw_stats.deletions(),
+        };
+        let patch = render_patch(&diff)?;
 
-        StagedChange::parse(&output)
+        Ok(ProspectiveCommit {
+            mode,
+            changes,
+            patch,
+            stats,
+        })
     }
 
-    /// Returns the changed line ranges for `path` in the commit represented by `mode`.
+    /// Return the complete raw patch for the prospective commit.
     ///
-    /// Hunks are computed without surrounding context so their ranges correspond
-    /// directly to the changed lines on the before and after sides of the commit.
-    ///
-    /// External diff programs and text-conversion filters are disabled to keep the
-    /// output deterministic and suitable for programmatic use.
-    pub fn commit_hunks(&self, mode: CommitMode, path: impl AsRef<Path>) -> Result<Vec<DiffHunk>> {
-        let output = self.run(
-            &[
-                "diff",
-                "--cached",
-                "--no-ext-diff",
-                "--no-textconv",
-                "--no-color",
-                "--default-prefix",
-                "--unified=0",
-                "--find-renames",
-                mode.base(),
-            ],
-            Some(path.as_ref()),
-        )?;
-
-        let diff = String::from_utf8_lossy(&output);
-        parse_hunks(&diff)
-    }
-
-    /// Returns the complete patch that would be represented by the next commit.
-    ///
-    /// In amend mode, the patch includes both the current HEAD commit and any additionally staged changes.
-    ///
-    /// The result is returned as raw bytes because arbitrary file contents are not guaranteed to be valid UTF-8.
-    ///
-    /// External diff programs and text-conversion filters are disabled to keep the output deterministic
-    /// and suitable for programmatic use.
+    /// The patch is rendered from the same rename-aware, zero-context diff used for structured changes.
     pub fn commit_diff(&self, mode: CommitMode) -> Result<Vec<u8>> {
-        self.run(
-            &[
-                "diff",
-                "--cached",
-                "--no-ext-diff",
-                "--no-textconv",
-                "--no-color",
-                "--default-prefix",
-                "--unified=3",
-                "--find-renames",
-                mode.base(),
-            ],
-            None,
-        )
+        Ok(self.prospective_commit(mode)?.into_patch())
     }
 
-    /// Returns a compact summary of the changes that would be represented by the next commit.
-    ///
-    /// In amend mode, the summary includes both the current HEAD commit and any
-    /// additionally staged changes.
-    ///
-    /// The summary shows the relative size of each changed file and aggregate insertion/deletion counts.
-    /// Output is bounded because the complete file list is provided separately as structured staged-change context.
-    pub fn commit_diff_stat(&self, mode: CommitMode) -> Result<String> {
-        self.text(
-            &[
-                "diff",
-                "--cached",
-                "--stat=100,70,30",
-                "--no-ext-diff",
-                "--no-textconv",
-                "--no-color",
-                "--find-renames",
-                mode.base(),
-            ],
-            None,
-        )
+    /// Read a blob by object ID.
+    pub fn blob(&self, oid: Oid) -> Result<Vec<u8>> {
+        let blob = self
+            .repository()
+            .find_blob(oid)
+            .with_context(|| format!("failed to read Git blob {oid}"))?;
+        Ok(blob.content().to_vec())
     }
 
-    /// Returns up to `limit` recent commit subjects, newest first.
-    ///
-    /// Only the subject line of each commit message is returned.
-    ///
-    /// Returns an empty vector when `limit` is zero or when the repository does not have any commits yet.
+    /// Return up to limit recent commit subjects, newest first.
     pub fn recent_commit_subjects(&self, limit: usize) -> Result<Vec<String>> {
-        if limit == 0 || self.head_sha()?.is_none() {
+        if limit == 0 || self.head_commit()?.is_none() {
             return Ok(Vec::new());
         }
-        let limit = limit.to_string();
-        let output = self.text(&["log", "-n", &limit, "--format=%s", "HEAD"], None)?;
-        Ok(output.lines().map(str::to_owned).collect())
+
+        let mut walk = self
+            .repository()
+            .revwalk()
+            .context("failed to create Git revision walk")?;
+        walk.set_sorting(Sort::TOPOLOGICAL | Sort::TIME)
+            .context("failed to configure Git revision walk")?;
+        walk.push_head().context("failed to walk from Git HEAD")?;
+
+        walk.take(limit)
+            .map(|id| {
+                let id = id.context("failed to walk Git commit history")?;
+                let commit = self
+                    .repository()
+                    .find_commit(id)
+                    .with_context(|| format!("failed to read Git commit {id}"))?;
+                Ok(commit.summary()?.unwrap_or_default().to_owned())
+            })
+            .collect()
     }
 
-    /// Returns the contents of a file from the Git index.
+    /// Return the contents of a file from the current index.
     ///
-    /// Returns `None` when `path` does not exist in the index.
+    /// None is returned when the path has no stage-zero index entry.
     pub fn index_file(&self, path: impl AsRef<Path>) -> Result<Option<Vec<u8>>> {
-        let listed = self.run(&["ls-files", "--cached", "-z"], Some(path.as_ref()))?;
-        if listed.is_empty() {
+        let index = self
+            .repository()
+            .index()
+            .context("failed to read Git index")?;
+        let Some(entry) = index.get_path(path.as_ref(), 0) else {
             return Ok(None);
+        };
+
+        self.blob(entry.id)
+            .map(Some)
+            .with_context(|| format!("failed to read indexed file {}", path.as_ref().display()))
+    }
+
+    fn prospective_diff(&self, mode: CommitMode) -> Result<Diff<'_>> {
+        let base = self.base_tree(mode)?;
+        let index = self
+            .repository()
+            .index()
+            .context("failed to read Git index")?;
+        let mut options = DiffOptions::new();
+        options
+            .context_lines(0)
+            .include_typechange(true)
+            .include_typechange_trees(true)
+            .indent_heuristic(true)
+            .old_prefix("a/")
+            .new_prefix("b/");
+
+        let mut diff = self
+            .repository()
+            .diff_tree_to_index(base.as_ref(), Some(&index), Some(&mut options))
+            .context("failed to compare the prospective commit base with the Git index")?;
+        let mut find = DiffFindOptions::new();
+        find.renames(true);
+        diff.find_similar(Some(&mut find))
+            .context("failed to detect prospective commit renames")?;
+
+        Ok(diff)
+    }
+}
+
+fn commit_changes(diff: &Diff<'_>) -> Result<Vec<CommitChange>> {
+    diff.deltas()
+        .enumerate()
+        .map(|(index, delta)| commit_change(diff, index, &delta))
+        .collect()
+}
+
+fn commit_change(diff: &Diff<'_>, index: usize, delta: &DiffDelta<'_>) -> Result<CommitChange> {
+    let status = delta.status();
+    let kind = match status {
+        Delta::Added => CommitChangeKind::Added {
+            after: file_version(&delta.new_file(), "added file")?,
+        },
+        Delta::Modified => CommitChangeKind::Modified {
+            before: file_version(&delta.old_file(), "modified file before version")?,
+            after: file_version(&delta.new_file(), "modified file after version")?,
+        },
+        Delta::Deleted => CommitChangeKind::Deleted {
+            before: file_version(&delta.old_file(), "deleted file")?,
+        },
+        Delta::Renamed => CommitChangeKind::Renamed {
+            before: file_version(&delta.old_file(), "renamed file before version")?,
+            after: file_version(&delta.new_file(), "renamed file after version")?,
+        },
+        Delta::Typechange => CommitChangeKind::TypeChanged {
+            before: file_version(&delta.old_file(), "type-changed file before version")?,
+            after: file_version(&delta.new_file(), "type-changed file after version")?,
+        },
+        Delta::Conflicted => CommitChangeKind::Unmerged {
+            path: delta
+                .new_file()
+                .path()
+                .or_else(|| delta.old_file().path())
+                .context("libgit2 omitted the path for an unmerged change")?
+                .to_path_buf(),
+        },
+        unsupported => {
+            bail!("libgit2 returned unsupported prospective commit status: {unsupported:?}")
         }
+    };
 
-        let mut spec = OsString::from(":");
-        spec.push(path.as_ref());
-        Ok(Some(self.run(
-            &["cat-file", "blob", &spec.to_string_lossy()],
-            None,
-        )?))
+    let hunks = if status == Delta::Conflicted {
+        Vec::new()
+    } else {
+        patch_hunks(diff, index)?
+    };
+    Ok(CommitChange { kind, hunks })
+}
+
+fn file_version(file: &DiffFile<'_>, description: &str) -> Result<FileVersion> {
+    if !file.exists() {
+        bail!("libgit2 reported a missing {description}");
+    }
+    let path = file
+        .path()
+        .with_context(|| format!("libgit2 omitted the path for {description}"))?
+        .to_path_buf();
+    let oid = file.id();
+    if oid.is_zero() {
+        bail!(
+            "libgit2 omitted the object ID for {description} at {}",
+            path.display()
+        );
     }
 
-    fn revision_file(&self, revision: &str, path: impl AsRef<Path>) -> Result<Option<Vec<u8>>> {
-        let listed = self.run(
-            &["ls-tree", "-z", "--name-only", revision],
-            Some(path.as_ref()),
-        )?;
-        if listed.is_empty() {
-            return Ok(None);
+    Ok(FileVersion {
+        path,
+        oid,
+        mode: file.mode(),
+    })
+}
+
+fn patch_hunks(diff: &Diff<'_>, index: usize) -> Result<Vec<DiffHunk>> {
+    let Some(patch) =
+        Patch::from_diff(diff, index).context("failed to read a prospective commit patch")?
+    else {
+        return Ok(Vec::new());
+    };
+
+    (0..patch.num_hunks())
+        .map(|index| {
+            let (hunk, _) = patch
+                .hunk(index)
+                .context("failed to read a prospective commit hunk")?;
+            Ok(DiffHunk {
+                before: line_range(hunk.old_start(), hunk.old_lines()),
+                after: line_range(hunk.new_start(), hunk.new_lines()),
+            })
+        })
+        .collect()
+}
+
+fn line_range(start: u32, count: u32) -> Option<LineRange> {
+    (count != 0).then(|| LineRange {
+        start: usize::try_from(start).expect("u32 fits in usize"),
+        count: usize::try_from(count).expect("u32 fits in usize"),
+    })
+}
+
+fn render_patch(diff: &Diff<'_>) -> Result<Vec<u8>> {
+    let mut output = Vec::new();
+    diff.print(DiffFormat::Patch, |_, _, line| {
+        match line.origin() {
+            ' ' => output.push(b' '),
+            '+' => output.push(b'+'),
+            '-' => output.push(b'-'),
+            _ => {}
         }
-
-        let mut spec = OsString::from(revision);
-        spec.push(":");
-        spec.push(path.as_ref());
-        Ok(Some(self.run(
-            &["cat-file", "blob", &spec.to_string_lossy()],
-            None,
-        )?))
-    }
-
-    /// Returns the contents of a file from the base tree of the commit represented by `mode`.
-    ///
-    /// Returns `None` when `path` does not exist in the base tree.
-    pub fn base_file(&self, mode: CommitMode, path: impl AsRef<Path>) -> Result<Option<Vec<u8>>> {
-        self.revision_file(mode.base(), path)
-    }
+        output.extend_from_slice(line.content());
+        true
+    })
+    .context("failed to render the prospective commit patch")?;
+    Ok(output)
 }

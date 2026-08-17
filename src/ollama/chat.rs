@@ -80,7 +80,7 @@ impl Default for ChatOptions {
             think: Some(false.into()),
             format: None,
             keep_alive: None,
-            timeout: Some(Duration::from_mins(1)),
+            timeout: Some(Duration::from_mins(3)),
         }
     }
 }

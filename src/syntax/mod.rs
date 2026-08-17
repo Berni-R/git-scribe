@@ -5,7 +5,7 @@ pub use context::*;
 pub use language::*;
 
 #[test]
-fn parses_supported_languages() -> anyhow::Result<()> {
+fn parses_supported_languages() {
     let cases = [
         (Language::Rust, "fn f() {}"),
         (Language::C, "void f(void) {}"),
@@ -38,6 +38,4 @@ fn parses_supported_languages() -> anyhow::Result<()> {
         );
         println!("{:?}", tree.root_node().utf8_text(source.as_bytes()));
     }
-
-    Ok(())
 }

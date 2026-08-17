@@ -1,169 +1,121 @@
-use std::ffi::OsStr;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::{
+    fmt,
+    path::{Path, PathBuf},
+};
 
-use anyhow::{Context as _, Result, anyhow, bail};
+use anyhow::{Context as _, Result, bail};
+use git2::{Commit, ErrorCode, Repository, Tree};
 
 /// A Git working-tree repository.
 ///
-/// `GitRepo` stores the absolute path to the repository's top-level working directory.
-/// It can be discovered from any directory inside that working tree.
-///
-/// This type currently represents repositories with a working tree;
-/// discovery of bare repositories is not supported because `git rev-parse --show-toplevel` requires a working tree.
-#[derive(Debug, Clone)]
+/// The repository remains open through libgit2 and records its canonical, absolute working-tree root.
+/// Bare repositories are not supported.
 pub struct GitRepo {
+    repository: Repository,
     root: PathBuf,
+}
+
+impl fmt::Debug for GitRepo {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GitRepo")
+            .field("root", &self.root)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Selects how the prospective commit is constructed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommitMode {
-    /// Create a new commit from the changes between `HEAD` and the current index.
+    /// Compare the current index with the tree at HEAD.
+    ///
+    /// An unborn repository uses an empty base tree.
     Normal,
 
-    /// Amend `HEAD`, using the changes between `HEAD^` and the current index.
+    /// Compare the current index with the first parent's tree of HEAD.
+    ///
+    /// A root commit uses an empty base tree. Merge commits are rejected.
     Amend,
 }
 
-impl CommitMode {
-    /// The base commit to use: `"HEAD"` for [`CommitMode::Normal`] and `"HEAD^` for [`CommitMode::Amend`].
-    #[must_use]
-    pub(super) fn base(self) -> &'static str {
-        match self {
-            Self::Normal => "HEAD",
-            Self::Amend => "HEAD^", // TODO: `--amend` is valid for `git` if the tree is empty, but this then fails
-        }
-    }
-}
-
 impl GitRepo {
-    /// Returns the absolute path to the repository's working-tree root.
+    /// Discover the Git working-tree repository containing directory.
+    pub fn discover(directory: impl AsRef<Path>) -> Result<Self> {
+        let directory = directory.as_ref();
+        let repository = Repository::discover(directory).with_context(|| {
+            format!(
+                "failed to discover a Git repository from {}",
+                directory.display()
+            )
+        })?;
+        let workdir = repository.workdir().with_context(|| {
+            format!("Git repository at {} is bare", repository.path().display())
+        })?;
+        let root = workdir.canonicalize().with_context(|| {
+            format!(
+                "failed to resolve Git working tree at {}",
+                workdir.display()
+            )
+        })?;
+
+        Ok(Self { repository, root })
+    }
+
+    /// Return the canonical, absolute path to the working-tree root.
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
     }
 
-    /// Discovers the Git repository containing `directory`.
-    ///
-    /// `directory` may be either the repository root or any directory below it.
-    ///
-    /// Returns an error if `directory` is not inside a Git working tree, Git cannot be executed,
-    /// or the returned repository path is not valid UTF-8.
-    pub fn discover(directory: impl AsRef<Path>) -> Result<Self> {
-        let directory = directory.as_ref();
+    pub(super) fn repository(&self) -> &Repository {
+        &self.repository
+    }
 
-        let stdout = run_git(directory, &["rev-parse", "--show-toplevel"], None)?;
+    /// Resolve HEAD to a commit, or return None for an unborn branch.
+    pub(super) fn head_commit(&self) -> Result<Option<Commit<'_>>> {
+        let head = match self.repository.head() {
+            Ok(head) => head,
+            Err(error) if error.code() == ErrorCode::UnbornBranch => return Ok(None),
+            Err(error) => return Err(error).context("failed to read Git HEAD"),
+        };
 
-        let root = String::from_utf8(stdout).context("Git repository path is not valid UTF-8")?;
-        let root = root.trim_end_matches(['\r', '\n']);
-        if root.is_empty() {
-            bail!(
-                "Git returned an empty repository root for {}",
-                directory.display()
-            );
+        head.peel_to_commit()
+            .map(Some)
+            .context("Git HEAD does not reference a commit")
+    }
+
+    /// Resolve the application commit mode to the tree that precedes the prospective commit.
+    ///
+    /// None deliberately represents the empty tree accepted by
+    /// `Repository::diff_tree_to_index`.
+    pub(super) fn base_tree(&self, mode: CommitMode) -> Result<Option<Tree<'_>>> {
+        let Some(head) = self.head_commit()? else {
+            return match mode {
+                CommitMode::Normal => Ok(None),
+                CommitMode::Amend => {
+                    bail!("cannot amend because the repository has no existing commit")
+                }
+            };
+        };
+
+        match mode {
+            CommitMode::Normal => head
+                .tree()
+                .map(Some)
+                .context("failed to read the Git HEAD tree"),
+            CommitMode::Amend => match head.parent_count() {
+                0 => Ok(None),
+                1 => head
+                    .parent(0)
+                    .context("failed to read the parent of Git HEAD")?
+                    .tree()
+                    .map(Some)
+                    .context("failed to read the parent tree of Git HEAD"),
+                count => bail!(
+                    "cannot amend merge commit {} with {count} parents; merge amendments are not supported",
+                    head.id()
+                ),
+            },
         }
-
-        Ok(Self {
-            root: PathBuf::from(root),
-        })
-    }
-
-    /// Executes Git in this repository without requiring a successful exit.
-    ///
-    /// Use this when a command's exit status itself carries information.
-    pub(super) fn execute(&self, args: &[&str]) -> Result<Output> {
-        execute_git(&self.root, args, None)
-    }
-
-    /// Executes Git in this repository and returns stdout.
-    ///
-    /// A non-zero Git exit status is treated as an error.
-    pub(super) fn run(&self, args: &[&str], path: Option<&Path>) -> Result<Vec<u8>> {
-        run_git(&self.root, args, path)
-    }
-
-    /// Executes Git and decodes stdout as UTF-8.
-    pub(super) fn text(&self, args: &[&str], path: Option<&Path>) -> Result<String> {
-        let stdout = self.run(args, path)?;
-
-        String::from_utf8(stdout).context("Git output is not valid UTF-8")
-    }
-}
-
-/// Executes Git and returns its complete process output.
-///
-/// Unlike [`run_git`], a non-zero Git exit status is not considered an error.
-/// This is useful for commands where particular exit codes represent ordinary
-/// states rather than failures.
-fn execute_git<S>(directory: &Path, args: &[S], path: Option<&Path>) -> Result<Output>
-where
-    S: AsRef<OsStr>,
-{
-    let mut command = Command::new("git");
-
-    command.arg("-C").arg(&directory).args(args);
-    if let Some(path) = path {
-        command.arg("--").arg(path);
-    }
-
-    command.output().with_context(|| {
-        format!(
-            "failed to execute Git in {:?} \
-                 (is Git installed and available on PATH?)",
-            directory
-        )
-    })
-}
-
-/// Executes Git and returns stdout if the command succeeds.
-fn run_git<S>(directory: &Path, args: &[S], path: Option<&Path>) -> Result<Vec<u8>>
-where
-    S: AsRef<OsStr>,
-{
-    let output = execute_git(directory, args, path)?;
-
-    if !output.status.success() {
-        return Err(git_command_error(directory, args, path, &output));
-    }
-
-    Ok(output.stdout)
-}
-
-/// Constructs a diagnostic error for an unsuccessful Git command.
-pub(super) fn git_command_error<S>(
-    directory: &Path,
-    args: &[S],
-    path: Option<&Path>,
-    output: &Output,
-) -> anyhow::Error
-where
-    S: AsRef<OsStr>,
-{
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stderr = stderr.trim_end();
-
-    let args = args.iter().map(|arg| format!("{:?}", arg.as_ref()));
-    let args: Vec<String> = if let Some(path) = path {
-        args.chain(["--".to_string(), path.to_string_lossy().into_owned()])
-            .collect()
-    } else {
-        args.collect()
-    };
-    let args = args.join(" ");
-    // TODO: earlier we had a debug print of a list – here individual argument should pontetially be put in quote (and be escaped?)
-
-    if stderr.is_empty() {
-        anyhow!(
-            "git {args} failed in {} ({})",
-            directory.display(),
-            output.status,
-        )
-    } else {
-        anyhow!(
-            "git {args} failed in {} ({}): {stderr}",
-            directory.display(),
-            output.status,
-        )
     }
 }

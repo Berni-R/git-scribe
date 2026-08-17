@@ -1,13 +1,15 @@
-//! Small, read-only wrapper around the installed `git` executable.
+//! Application-facing Git concepts backed by `git2`/libgit2.
 //!
-//! This module intentionally uses the Git CLI rather than a Git implementation library.
-//! That gives us Git's own repository/configuration semantics while keeping the wrapper small.
+//! The boundary exposes owned prospective commits and file versions rather than command-shaped operations.
 
+mod change;
 mod commands;
 mod hunk;
 mod repo;
-mod staged;
 
+pub use change::*;
 pub use hunk::*;
 pub use repo::*;
-pub use staged::*;
+
+#[cfg(test)]
+mod tests;
