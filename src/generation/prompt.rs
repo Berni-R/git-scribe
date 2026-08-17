@@ -269,7 +269,7 @@ fn file_change_status_text(changes: &[StagedChange]) -> String {
 
 /// Return the root `README.md` from the Git index, clipped to the given token budget.
 fn readme(repo: &GitRepo, budget: usize) -> Result<String> {
-    let full_readme = match repo.index_file("README.md")? {
+    let full_readme = match repo.index_file(Path::new("README.md"))? {
         Some(contents) => String::from_utf8_lossy(&contents).into_owned(),
         None => "(no root README.md in the Git index)".to_owned(),
     };

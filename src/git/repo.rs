@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -52,7 +53,7 @@ impl GitRepo {
     pub fn discover(directory: impl AsRef<Path>) -> Result<Self> {
         let directory = directory.as_ref();
 
-        let stdout = run_git(directory, &["rev-parse", "--show-toplevel"])?;
+        let stdout = run_git(directory, &["rev-parse", "--show-toplevel"], None)?;
 
         let root = String::from_utf8(stdout).context("Git repository path is not valid UTF-8")?;
         let root = root.trim_end_matches(['\r', '\n']);
@@ -72,19 +73,19 @@ impl GitRepo {
     ///
     /// Use this when a command's exit status itself carries information.
     pub(super) fn execute(&self, args: &[&str]) -> Result<Output> {
-        execute_git(&self.root, args)
+        execute_git(&self.root, args, None)
     }
 
     /// Executes Git in this repository and returns stdout.
     ///
     /// A non-zero Git exit status is treated as an error.
-    pub(super) fn run(&self, args: &[&str]) -> Result<Vec<u8>> {
-        run_git(&self.root, args)
+    pub(super) fn run(&self, args: &[&str], path: Option<&Path>) -> Result<Vec<u8>> {
+        run_git(&self.root, args, path)
     }
 
     /// Executes Git and decodes stdout as UTF-8.
-    pub(super) fn text(&self, args: &[&str]) -> Result<String> {
-        let stdout = self.run(args)?;
+    pub(super) fn text(&self, args: &[&str], path: Option<&Path>) -> Result<String> {
+        let stdout = self.run(args, path)?;
 
         String::from_utf8(stdout).context("Git output is not valid UTF-8")
     }
@@ -95,46 +96,72 @@ impl GitRepo {
 /// Unlike [`run_git`], a non-zero Git exit status is not considered an error.
 /// This is useful for commands where particular exit codes represent ordinary
 /// states rather than failures.
-fn execute_git(directory: &Path, args: &[&str]) -> Result<Output> {
-    Command::new("git")
-        .arg("-C")
-        .arg(directory)
-        .args(args)
-        .output()
-        .with_context(|| {
-            format!(
-                "failed to execute Git in {} \
+fn execute_git<S>(directory: &Path, args: &[S], path: Option<&Path>) -> Result<Output>
+where
+    S: AsRef<OsStr>,
+{
+    let mut command = Command::new("git");
+
+    command.arg("-C").arg(&directory).args(args);
+    if let Some(path) = path {
+        command.arg("--").arg(path);
+    }
+
+    command.output().with_context(|| {
+        format!(
+            "failed to execute Git in {:?} \
                  (is Git installed and available on PATH?)",
-                directory.display()
-            )
-        })
+            directory
+        )
+    })
 }
 
 /// Executes Git and returns stdout if the command succeeds.
-fn run_git(directory: &Path, args: &[&str]) -> Result<Vec<u8>> {
-    let output = execute_git(directory, args)?;
+fn run_git<S>(directory: &Path, args: &[S], path: Option<&Path>) -> Result<Vec<u8>>
+where
+    S: AsRef<OsStr>,
+{
+    let output = execute_git(directory, args, path)?;
 
     if !output.status.success() {
-        return Err(git_command_error(directory, args, &output));
+        return Err(git_command_error(directory, args, path, &output));
     }
 
     Ok(output.stdout)
 }
 
 /// Constructs a diagnostic error for an unsuccessful Git command.
-pub(super) fn git_command_error(directory: &Path, args: &[&str], output: &Output) -> anyhow::Error {
+pub(super) fn git_command_error<S>(
+    directory: &Path,
+    args: &[S],
+    path: Option<&Path>,
+    output: &Output,
+) -> anyhow::Error
+where
+    S: AsRef<OsStr>,
+{
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stderr = stderr.trim_end();
 
+    let args = args.iter().map(|arg| format!("{:?}", arg.as_ref()));
+    let args: Vec<String> = if let Some(path) = path {
+        args.chain(["--".to_string(), path.to_string_lossy().into_owned()])
+            .collect()
+    } else {
+        args.collect()
+    };
+    let args = args.join(" ");
+    // TODO: earlier we had a debug print of a list – here individual argument should pontetially be put in quote (and be escaped?)
+
     if stderr.is_empty() {
         anyhow!(
-            "git {args:?} failed in {} ({})",
+            "git {args} failed in {} ({})",
             directory.display(),
             output.status,
         )
     } else {
         anyhow!(
-            "git {args:?} failed in {} ({}): {stderr}",
+            "git {args} failed in {} ({}): {stderr}",
             directory.display(),
             output.status,
         )

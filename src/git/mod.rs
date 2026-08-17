@@ -4,8 +4,10 @@
 //! That gives us Git's own repository/configuration semantics while keeping the wrapper small.
 
 mod commands;
+mod hunk;
 mod repo;
 mod staged;
 
-pub use repo::{CommitMode, GitRepo};
-pub use staged::{StagedChange, StagedChangeKind};
+pub use hunk::*;
+pub use repo::*;
+pub use staged::*;

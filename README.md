@@ -26,11 +26,7 @@ git add ...
 git sight
 ```
 
-Git automatically maps the `git sight` command to an executable named `git-sight` on your `PATH` (not yet implemented).
-
-## Status
-
-This is currently just an early proof of concept written in Python.
+Git automatically maps the `git sight` command to an executable named `git-sight` on your `PATH`.
 
 ## Installation
 

@@ -1,6 +1,10 @@
+use std::{ffi::OsString, path::Path};
+
 use anyhow::{Context as _, Result};
 
-use crate::git::{CommitMode, GitRepo, repo::git_command_error, staged::StagedChange};
+use crate::git::{
+    CommitMode, DiffHunk, GitRepo, parse_hunks, repo::git_command_error, staged::StagedChange,
+};
 
 impl GitRepo {
     /// Returns the commit ID currently referenced by `HEAD`.
@@ -30,7 +34,7 @@ impl GitRepo {
         if head.status.success() {
             return Ok(None);
         }
-        Err(git_command_error(self.root(), &args, &output))
+        Err(git_command_error(self.root(), &args, None, &output))
     }
 
     /// Returns the name of the currently checked-out branch.
@@ -53,7 +57,7 @@ impl GitRepo {
             // which is the normal detached HEAD case.
             Some(1) => Ok(None),
 
-            _ => Err(git_command_error(self.root(), &args, &output)),
+            _ => Err(git_command_error(self.root(), &args, None, &output)),
         }
     }
 
@@ -64,7 +68,10 @@ impl GitRepo {
     /// This explicitly enables normal untracked-file reporting so that the result is not affected by the user's
     /// `status.showUntrackedFiles` configuration.
     pub fn is_dirty(&self) -> Result<bool> {
-        let output = self.run(&["status", "--porcelain=v1", "--untracked-files=normal", "-z"])?;
+        let output = self.run(
+            &["status", "--porcelain=v1", "--untracked-files=normal", "-z"],
+            None,
+        )?;
         Ok(!output.is_empty())
     }
 
@@ -77,16 +84,46 @@ impl GitRepo {
     /// expensive `--find-copies-harder` mode, while copy information is not currently important enough to justify that
     /// additional work.
     pub fn commit_changes(&self, mode: CommitMode) -> Result<Vec<StagedChange>> {
-        let output = self.run(&[
-            "diff",
-            "--cached",
-            "--name-status",
-            "-z",
-            "--find-renames",
-            mode.base(),
-        ])?;
+        let output = self.run(
+            &[
+                "diff",
+                "--cached",
+                "--name-status",
+                "-z",
+                "--find-renames",
+                mode.base(),
+            ],
+            None,
+        )?;
 
         StagedChange::parse(&output)
+    }
+
+    /// Returns the changed line ranges for `path` in the commit represented by `mode`.
+    ///
+    /// Hunks are computed without surrounding context so their ranges correspond
+    /// directly to the changed lines on the before and after sides of the commit.
+    ///
+    /// External diff programs and text-conversion filters are disabled to keep the
+    /// output deterministic and suitable for programmatic use.
+    pub fn commit_hunks(&self, mode: CommitMode, path: impl AsRef<Path>) -> Result<Vec<DiffHunk>> {
+        let output = self.run(
+            &[
+                "diff",
+                "--cached",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-color",
+                "--default-prefix",
+                "--unified=0",
+                "--find-renames",
+                mode.base(),
+            ],
+            Some(path.as_ref()),
+        )?;
+
+        let diff = String::from_utf8_lossy(&output);
+        parse_hunks(&diff)
     }
 
     /// Returns the complete patch that would be represented by the next commit.
@@ -98,17 +135,20 @@ impl GitRepo {
     /// External diff programs and text-conversion filters are disabled to keep the output deterministic
     /// and suitable for programmatic use.
     pub fn commit_diff(&self, mode: CommitMode) -> Result<Vec<u8>> {
-        self.run(&[
-            "diff",
-            "--cached",
-            "--no-ext-diff",
-            "--no-textconv",
-            "--no-color",
-            "--default-prefix",
-            "--unified=3",
-            "--find-renames",
-            mode.base(),
-        ])
+        self.run(
+            &[
+                "diff",
+                "--cached",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-color",
+                "--default-prefix",
+                "--unified=3",
+                "--find-renames",
+                mode.base(),
+            ],
+            None,
+        )
     }
 
     /// Returns a compact summary of the changes that would be represented by the next commit.
@@ -119,16 +159,19 @@ impl GitRepo {
     /// The summary shows the relative size of each changed file and aggregate insertion/deletion counts.
     /// Output is bounded because the complete file list is provided separately as structured staged-change context.
     pub fn commit_diff_stat(&self, mode: CommitMode) -> Result<String> {
-        self.text(&[
-            "diff",
-            "--cached",
-            "--stat=100,70,30",
-            "--no-ext-diff",
-            "--no-textconv",
-            "--no-color",
-            "--find-renames",
-            mode.base(),
-        ])
+        self.text(
+            &[
+                "diff",
+                "--cached",
+                "--stat=100,70,30",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-color",
+                "--find-renames",
+                mode.base(),
+            ],
+            None,
+        )
     }
 
     /// Returns up to `limit` recent commit subjects, newest first.
@@ -141,20 +184,49 @@ impl GitRepo {
             return Ok(Vec::new());
         }
         let limit = limit.to_string();
-        let output = self.text(&["log", "-n", &limit, "--format=%s", "HEAD"])?;
+        let output = self.text(&["log", "-n", &limit, "--format=%s", "HEAD"], None)?;
         Ok(output.lines().map(str::to_owned).collect())
     }
 
     /// Returns the contents of a file from the Git index.
     ///
     /// Returns `None` when `path` does not exist in the index.
-    pub fn index_file(&self, path: &str) -> Result<Option<Vec<u8>>> {
-        let listed = self.run(&["ls-files", "--cached", "-z", "--", path])?;
+    pub fn index_file(&self, path: impl AsRef<Path>) -> Result<Option<Vec<u8>>> {
+        let listed = self.run(&["ls-files", "--cached", "-z"], Some(path.as_ref()))?;
         if listed.is_empty() {
             return Ok(None);
         }
 
-        let spec = format!(":{path}");
-        Ok(Some(self.run(&["show", &spec])?))
+        let mut spec = OsString::from(":");
+        spec.push(path.as_ref());
+        Ok(Some(self.run(
+            &["cat-file", "blob", &spec.to_string_lossy()],
+            None,
+        )?))
+    }
+
+    fn revision_file(&self, revision: &str, path: impl AsRef<Path>) -> Result<Option<Vec<u8>>> {
+        let listed = self.run(
+            &["ls-tree", "-z", "--name-only", revision],
+            Some(path.as_ref()),
+        )?;
+        if listed.is_empty() {
+            return Ok(None);
+        }
+
+        let mut spec = OsString::from(revision);
+        spec.push(":");
+        spec.push(path.as_ref());
+        Ok(Some(self.run(
+            &["cat-file", "blob", &spec.to_string_lossy()],
+            None,
+        )?))
+    }
+
+    /// Returns the contents of a file from the base tree of the commit represented by `mode`.
+    ///
+    /// Returns `None` when `path` does not exist in the base tree.
+    pub fn base_file(&self, mode: CommitMode, path: impl AsRef<Path>) -> Result<Option<Vec<u8>>> {
+        self.revision_file(mode.base(), path)
     }
 }
