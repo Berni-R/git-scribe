@@ -53,6 +53,15 @@ impl Fixture {
         self.stage(path)
     }
 
+    fn configure_cli_commit(&self) -> Result<()> {
+        let mut config = self.repository.config()?;
+        config.set_str("user.name", "Git Sight Tests")?;
+        config.set_str("user.email", "tests@example.com")?;
+        config.set_str("core.editor", "true")?;
+        config.set_bool("commit.gpgsign", false)?;
+        Ok(())
+    }
+
     fn delete_and_stage(&self, path: &str) -> Result<()> {
         fs::remove_file(self.path.join(path))?;
         let mut index = self.repository.index()?;
@@ -205,6 +214,36 @@ fn normal_modification_has_versions_and_zero_context_hunk() -> Result<()> {
         }]
     );
     assert!(String::from_utf8(commit.patch().to_vec())?.contains("-two\n+second\n+extra\n"));
+    Ok(())
+}
+
+#[test]
+fn interactive_commit_prefills_message_and_supports_amend() -> Result<()> {
+    let fixture = Fixture::new()?;
+    fixture.configure_cli_commit()?;
+    fixture.write_and_stage("file.txt", "first\n")?;
+    let repo = fixture.git_repo()?;
+
+    repo.commit_interactively(CommitMode::Normal, "Describe first version\n\nInitial body")?;
+    let first = fixture.repository.head()?.peel_to_commit()?;
+    assert_eq!(
+        first.message()?.trim_end(),
+        "Describe first version\n\nInitial body"
+    );
+    assert_eq!(first.parent_count(), 0);
+    let first_id = first.id();
+    drop(first);
+
+    fixture.write_and_stage("file.txt", "amended\n")?;
+    repo.commit_interactively(CommitMode::Amend, "Describe amended version")?;
+    let amended = fixture.repository.head()?.peel_to_commit()?;
+    assert_ne!(amended.id(), first_id);
+    assert_eq!(amended.message()?.trim_end(), "Describe amended version");
+    assert_eq!(amended.parent_count(), 0);
+    assert_eq!(
+        amended.tree()?.get_path(Path::new("file.txt"))?.id(),
+        fixture.repository.blob(b"amended\n")?
+    );
     Ok(())
 }
 

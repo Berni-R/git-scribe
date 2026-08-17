@@ -2,6 +2,7 @@ use std::{
     ffi::OsStr,
     fs,
     path::{Path, PathBuf},
+    process::Command,
 };
 
 use anyhow::{Context as _, Result, bail};
@@ -84,6 +85,25 @@ impl GitRepo {
     /// The patch is rendered from the same rename-aware, zero-context diff used for structured changes.
     pub fn commit_diff(&self, mode: CommitMode) -> Result<Vec<u8>> {
         Ok(self.prospective_commit(mode)?.into_patch())
+    }
+
+    /// Open Git's normal commit editor with `message` as its initial contents.
+    ///
+    /// The Git command remains responsible for editing, hooks, signing, and creating the commit.
+    pub fn commit_interactively(&self, mode: CommitMode, message: &str) -> Result<()> {
+        let mut command = Command::new("git");
+        command.current_dir(self.root()).arg("commit");
+        if mode == CommitMode::Amend {
+            command.arg("--amend");
+        }
+        command.args(["--edit", "--message", message]);
+
+        let status = command.status().context("failed to run git commit")?;
+        if !status.success() {
+            bail!("git commit failed with {status}");
+        }
+
+        Ok(())
     }
 
     /// Read a blob by object ID.

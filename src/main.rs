@@ -158,15 +158,16 @@ fn main() -> Result<()> {
     }
 
     let subject = answer.normalized_subject()?;
-    // stdout intentionally contains only text suitable for `git commit`.
-    println!("{subject}");
-
+    let mut commit_message = subject;
     if !args.no_body
         && let Some(body) = answer.normalized_body()
     {
-        println!();
-        println!("{body}");
+        commit_message.push_str("\n\n");
+        commit_message.push_str(body);
     }
+
+    eprintln!("git-sight: opening the Git commit editor");
+    repo.commit_interactively(mode, &commit_message)?;
 
     Ok(())
 }

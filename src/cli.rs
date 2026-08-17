@@ -4,7 +4,10 @@ use clap::Parser;
 use git_sight::{git::CommitMode, ollama::Think};
 
 #[derive(Debug, Parser)]
-#[command(version, about = "Generate commit messages from staged changes")]
+#[command(
+    version,
+    about = "Generate a commit message and open it in Git's commit editor"
+)]
 pub struct Cli {
     /// Repository to inspect.
     #[arg(value_name = "PATH", default_value = ".")]
@@ -27,7 +30,7 @@ pub struct Cli {
     #[arg(long, default_value = "qwen3.5:4b")]
     pub model: String,
 
-    /// Suppress any potentially generated message body and return only the one-line subject.
+    /// Prefill the commit editor with only the generated one-line subject.
     #[arg(short, long)]
     pub no_body: bool,
 

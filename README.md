@@ -1,6 +1,7 @@
 # git-sight
 
-`git-sight` suggests commit messages from your **staged Git changes** using a local LLM.
+`git-sight` suggests commit messages from your **staged Git changes** using a local LLM,
+then opens Git's commit editor with the suggestion prefilled.
 
 Unlike tools that simply summarize `git diff`,
 `git-sight` tries to infer the **intent** of a change in the context of the repository.
@@ -25,6 +26,9 @@ Stage the changes you want to commit:
 git add ...
 git sight
 ```
+
+Review or revise the generated message in your configured Git editor, then save and close it to
+create the commit. Pass `--amend` to generate and edit a message for the complete amended commit.
 
 Git automatically maps the `git sight` command to an executable named `git-sight` on your `PATH`.
 
