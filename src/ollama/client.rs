@@ -49,7 +49,7 @@ impl Client {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    /// ```rust,ignore
     /// let response = self.client
     ///     .get(format!("{}/api/tags", self.base_url))
     ///     .timeout(Duration::from_secs(3));

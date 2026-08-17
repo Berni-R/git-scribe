@@ -14,13 +14,7 @@ impl GitRepo {
     ///
     /// Returns an error if Git cannot be executed, `HEAD` cannot be inspected, or Git returns unexpected output.
     pub fn head_sha(&self) -> Result<Option<String>> {
-        let args = [
-            "rev-parse",
-            "--verify",
-            "--quiet",
-            "--path-format=absolute",
-            "HEAD^{commit}",
-        ];
+        let args = ["rev-parse", "--verify", "--quiet", "HEAD^{commit}"];
         let output = self.execute(&args)?;
         if output.status.success() {
             let sha =
