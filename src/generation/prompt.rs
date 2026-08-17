@@ -1,10 +1,11 @@
-use std::{fs, path::Path};
+use std::{fmt::Write as _, fs, path::Path};
 
 use anyhow::{Context as _, Result, bail};
 
 use crate::{
     GitRepo,
     git::{CommitChange, CommitMode, ProspectiveCommit},
+    syntax::{SyntaxContext, SyntaxEntry, SyntaxItem, context_for_change},
 };
 
 /// Model context for commit-message generation together with its estimated token cost.
@@ -21,6 +22,7 @@ pub struct Prompt {
 }
 
 const CLIP_SUFFIX: &str = "\n...[clipped for context budget]...";
+const README_OMITTED: &str = "(README omitted)";
 
 /// Number of recent commit subjects included as evidence for repository-specific commit-message style.
 const RECENT_COMMITS: usize = 12;
@@ -33,6 +35,9 @@ const ESTIMATED_BYTES_PER_TOKEN: f64 = 3.3;
 
 /// Maximum amount of README text included as supporting repository context.
 const MAX_README_CONTEXT_TOKENS: usize = 1_500;
+
+/// Maximum prompt space used for tree-sitter-derived structural evidence.
+const MAX_SYNTAX_CONTEXT_TOKENS: usize = 2_000;
 
 /// Context capacity deliberately left unused by our raw-message budget.
 ///
@@ -57,6 +62,8 @@ Use the supplied information according to its role:
 - Recent commit subjects are evidence for commit-message style and terminology;
   do not attribute their changes to the current commit.
 - The README provides project context and terminology, not evidence that a particular change occurred.
+- Syntax context identifies source constructs associated with changed lines before and after the commit;
+  it is structural evidence and does not itself prove behavior, motivation, or intent.
 
 Infer the coherent purpose of the changes, then write the commit message at the highest useful level of abstraction
 that is fully supported.
@@ -78,7 +85,7 @@ that is fully supported.
     /// Build model context for `commit` within the given token budget.
     ///
     /// The complete commit diff and required metadata are always retained;
-    /// README context is clipped as necessary.
+    /// syntax context is included as complete per-file blocks and README context is clipped as necessary.
     /// Returns an error if the required context alone exceeds the budget or repository context cannot be read.
     pub fn new(
         repo: &GitRepo,
@@ -95,15 +102,16 @@ that is fully supported.
         // The complete prospective-commit diff is non-negotiable.
         // First measure the prompt with README contents omitted.
         // If this alone does not fit, the commit should be split rather than silently dropping part of the diff.
-        let minimal = render_prompt(
-            &branch,
-            &history,
-            &commit_files,
-            &commit_stats,
-            "(README omitted)",
-            context,
-            &diff,
-        );
+        let minimal = render_prompt(PromptParts {
+            branch: &branch,
+            history: &history,
+            commit_files: &commit_files,
+            commit_stats: &commit_stats,
+            syntax_context: None,
+            readme: README_OMITTED,
+            author_context: context,
+            diff: &diff,
+        });
         let fixed = estimate_tokens(&format!("{}{minimal}", Self::SYSTEM));
 
         if fixed > token_budget {
@@ -115,21 +123,43 @@ that is fully supported.
             );
         }
 
+        let syntax_budget = MAX_SYNTAX_CONTEXT_TOKENS.min(token_budget - fixed);
+        let syntax_contexts = if syntax_budget == 0 {
+            Vec::new()
+        } else {
+            syntax_contexts(repo, commit.changes())?
+        };
+        let syntax_contexts = select_syntax_contexts(syntax_contexts, syntax_budget);
+        let syntax_context = (!syntax_contexts.is_empty()).then_some(syntax_contexts.as_slice());
+        let with_syntax = render_prompt(PromptParts {
+            branch: &branch,
+            history: &history,
+            commit_files: &commit_files,
+            commit_stats: &commit_stats,
+            syntax_context,
+            readme: README_OMITTED,
+            author_context: context,
+            diff: &diff,
+        });
+        let syntax_fixed = estimate_tokens(&format!("{}{with_syntax}", Self::SYSTEM));
+
         // README context has diminishing value after the project purpose and major architecture are established,
         // so do not let a large README consume every otherwise-unused token in the model context.
-        let remaining = token_budget - fixed;
-        let readme_budget = MAX_README_CONTEXT_TOKENS.min(remaining);
+        let remaining = token_budget.saturating_sub(syntax_fixed);
+        let readme_budget = MAX_README_CONTEXT_TOKENS
+            .min(remaining.saturating_add(estimate_tokens(README_OMITTED)));
         let readme = readme(repo, readme_budget)?;
 
-        let text = render_prompt(
-            &branch,
-            &history,
-            &commit_files,
-            &commit_stats,
-            &readme,
-            context,
-            &diff,
-        );
+        let text = render_prompt(PromptParts {
+            branch: &branch,
+            history: &history,
+            commit_files: &commit_files,
+            commit_stats: &commit_stats,
+            syntax_context,
+            readme: &readme,
+            author_context: context,
+            diff: &diff,
+        });
         let estimated_tokens = estimate_tokens(&format!("{}{text}", Self::SYSTEM));
 
         if estimated_tokens > token_budget {
@@ -178,20 +208,25 @@ that is fully supported.
     }
 }
 
+#[derive(Clone, Copy)]
+struct PromptParts<'a> {
+    branch: &'a str,
+    history: &'a str,
+    commit_files: &'a str,
+    commit_stats: &'a str,
+    syntax_context: Option<&'a [SyntaxContext]>,
+    readme: &'a str,
+    author_context: &'a [String],
+    diff: &'a str,
+}
+
 /// Render the model prompt from the collected repository context.
-fn render_prompt(
-    branch: &str,
-    history: &str,
-    commit_files: &str,
-    commit_stats: &str,
-    readme: &str,
-    context: &[String],
-    diff: &str,
-) -> String {
-    let additional_context = if context.is_empty() {
+fn render_prompt(parts: PromptParts<'_>) -> String {
+    let additional_context = if parts.author_context.is_empty() {
         String::new()
     } else {
-        let items = context
+        let items = parts
+            .author_context
             .iter()
             .map(|item| format!("- {item}"))
             .collect::<Vec<_>>()
@@ -204,6 +239,17 @@ fn render_prompt(
 "
         )
     };
+
+    let syntax_context = syntax_context_section(parts.syntax_context);
+    let PromptParts {
+        branch,
+        history,
+        commit_files,
+        commit_stats,
+        readme,
+        diff,
+        ..
+    } = parts;
 
     format!(
         r"Suggest one commit message.
@@ -219,6 +265,7 @@ fn render_prompt(
 
 ## Files in commit
 {commit_files}
+{syntax_context}
 
 ## Root README.md from the Git index
 ````markdown
@@ -231,6 +278,140 @@ fn render_prompt(
 ```
 "
     )
+}
+
+fn syntax_contexts(repo: &GitRepo, changes: &[CommitChange]) -> Result<Vec<SyntaxContext>> {
+    let mut contexts = Vec::new();
+    for change in changes {
+        let Some(context) = context_for_change(repo, change)? else {
+            continue;
+        };
+        contexts.push(context);
+    }
+    Ok(contexts)
+}
+
+/// Keep complete high-value file contexts within the global supporting-evidence budget.
+fn select_syntax_contexts(contexts: Vec<SyntaxContext>, budget: usize) -> Vec<SyntaxContext> {
+    let mut ranked = contexts.into_iter().enumerate().collect::<Vec<_>>();
+    ranked.sort_by(|(left_index, left), (right_index, right)| {
+        right
+            .priority()
+            .cmp(&left.priority())
+            .then_with(|| left_index.cmp(right_index))
+    });
+
+    let mut selected = Vec::new();
+    let mut rendered = String::new();
+    for (index, context) in ranked {
+        let block = render_syntax_context(&context);
+        let candidate = if rendered.is_empty() {
+            block
+        } else {
+            format!("{rendered}\n\n{block}")
+        };
+        if estimate_tokens(&syntax_context_section_text(&candidate)) <= budget {
+            rendered = candidate;
+            selected.push((index, context));
+        }
+    }
+
+    selected.sort_by_key(|(index, _)| *index);
+    selected.into_iter().map(|(_, context)| context).collect()
+}
+
+fn syntax_context_section(contexts: Option<&[SyntaxContext]>) -> String {
+    let Some(contexts) = contexts.filter(|contexts| !contexts.is_empty()) else {
+        return String::new();
+    };
+    let rendered = contexts
+        .iter()
+        .map(render_syntax_context)
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    syntax_context_section_text(&rendered)
+}
+
+fn syntax_context_section_text(rendered: &str) -> String {
+    format!(
+        r"
+## Syntax context
+Changed-line structure. BEFORE = base; AFTER = prospective commit.
+````text
+{rendered}
+````
+"
+    )
+}
+
+fn render_syntax_context(context: &SyntaxContext) -> String {
+    let path = match (&context.before, &context.after) {
+        (Some(before), Some(after)) if before.path != after.path => {
+            format!("{} -> {}", before.path.display(), after.path.display())
+        }
+        (_, Some(after)) => after.path.display().to_string(),
+        (Some(before), None) => before.path.display().to_string(),
+        (None, None) => return String::new(),
+    };
+    let mut rendered = format!("### {path}\nlanguage: {}\n", context.language.fence_name());
+    let before = context
+        .before
+        .as_ref()
+        .filter(|side| !side.entries.is_empty());
+    let after = context
+        .after
+        .as_ref()
+        .filter(|side| !side.entries.is_empty());
+
+    match (before, after) {
+        (Some(before), Some(after)) if same_entries(&before.entries, &after.entries) => {
+            rendered.push_str("\nCONTEXT:\n");
+            render_entries(&mut rendered, &after.entries);
+        }
+        (before, after) => {
+            if let Some(before) = before {
+                rendered.push_str("\nBEFORE:\n");
+                render_entries(&mut rendered, &before.entries);
+            }
+            if let Some(after) = after {
+                rendered.push_str("\nAFTER:\n");
+                render_entries(&mut rendered, &after.entries);
+            }
+        }
+    }
+
+    rendered.trim_end().to_owned()
+}
+
+fn same_entries(before: &[SyntaxEntry], after: &[SyntaxEntry]) -> bool {
+    before.len() == after.len()
+        && before.iter().zip(after).all(|(before, after)| {
+            before
+                .items
+                .iter()
+                .map(|item| (item.kind, &item.declaration))
+                .eq(after
+                    .items
+                    .iter()
+                    .map(|item| (item.kind, &item.declaration)))
+        })
+}
+
+fn render_entries(output: &mut String, entries: &[SyntaxEntry]) {
+    let mut previous: &[SyntaxItem] = &[];
+    for entry in entries {
+        let common = previous
+            .iter()
+            .zip(&entry.items)
+            .take_while(|(left, right)| left == right)
+            .count();
+        for (depth, item) in entry.items.iter().enumerate().skip(common) {
+            for line in item.declaration.lines() {
+                let _ = writeln!(output, "{}{line}", "  ".repeat(depth));
+            }
+        }
+        previous = &entry.items;
+    }
 }
 
 /// Name the current branch or detached HEAD mode.
@@ -300,4 +481,94 @@ fn clip_tokens(text: &str, limit: usize) -> String {
 #[allow(clippy::cast_sign_loss)]
 fn estimate_tokens(text: &str) -> usize {
     (text.len() as f64 / ESTIMATED_BYTES_PER_TOKEN).ceil() as usize
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use crate::syntax::{SyntaxKind, SyntaxSide};
+
+    use super::*;
+
+    fn item(kind: SyntaxKind, declaration: &str, start_line: usize) -> SyntaxItem {
+        SyntaxItem {
+            kind,
+            declaration: declaration.to_owned(),
+            start_line,
+        }
+    }
+
+    fn side(path: &str, items: Vec<SyntaxItem>) -> SyntaxSide {
+        SyntaxSide {
+            path: PathBuf::from(path),
+            entries: vec![SyntaxEntry { items }],
+        }
+    }
+
+    #[test]
+    fn identical_sides_render_once_as_shared_context() {
+        let items = vec![
+            item(SyntaxKind::Impl, "impl ApiClient", 1),
+            item(SyntaxKind::Method, "fn request(&self)", 2),
+        ];
+        let context = SyntaxContext {
+            language: crate::syntax::Language::Rust,
+            before: Some(side("src/client.rs", items.clone())),
+            after: Some(side("src/client.rs", items)),
+        };
+
+        assert_eq!(
+            render_syntax_context(&context),
+            "### src/client.rs\nlanguage: rust\n\nCONTEXT:\nimpl ApiClient\n  fn request(&self)"
+        );
+    }
+
+    #[test]
+    fn changed_structure_renders_before_and_after_separately() {
+        let context = SyntaxContext {
+            language: crate::syntax::Language::Rust,
+            before: Some(side(
+                "src/client.rs",
+                vec![item(SyntaxKind::Impl, "impl OldClient", 1)],
+            )),
+            after: Some(side(
+                "src/client.rs",
+                vec![item(SyntaxKind::Impl, "impl Client", 1)],
+            )),
+        };
+
+        assert_eq!(
+            render_syntax_context(&context),
+            "### src/client.rs\nlanguage: rust\n\nBEFORE:\nimpl OldClient\n\nAFTER:\nimpl Client"
+        );
+    }
+
+    #[test]
+    fn global_budget_prefers_higher_value_context() {
+        let low = SyntaxContext {
+            language: crate::syntax::Language::Json,
+            before: None,
+            after: Some(side(
+                "config.json",
+                vec![item(SyntaxKind::Other, "\"timeout\":", 1)],
+            )),
+        };
+        let high = SyntaxContext {
+            language: crate::syntax::Language::Rust,
+            before: None,
+            after: Some(side(
+                "src/client.rs",
+                vec![item(SyntaxKind::Function, "fn request()", 1)],
+            )),
+        };
+        let budget = estimate_tokens(&syntax_context_section_text(&render_syntax_context(&high)));
+
+        let selected = select_syntax_contexts(vec![low, high], budget);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(
+            selected[0].after.as_ref().unwrap().path,
+            Path::new("src/client.rs")
+        );
+    }
 }
