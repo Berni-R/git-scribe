@@ -271,6 +271,51 @@ fn prospective_commit_reads_index_not_worktree() -> Result<()> {
 }
 
 #[test]
+fn working_tree_context_includes_only_non_ignored_files() -> Result<()> {
+    let fixture = Fixture::new()?;
+    fixture.write(".gitignore", "ignored.txt\nignored-directory/\n")?;
+    fixture.write("visible.txt", "visible\n")?;
+    fixture.write("nested/untracked.rs", "fn untracked() {}\n")?;
+    fixture.write("ignored.txt", "ignored\n")?;
+    fixture.write("ignored-directory/secret.txt", "ignored\n")?;
+    let repo = fixture.git_repo()?;
+
+    assert_eq!(
+        repo.working_tree_files()?,
+        [
+            PathBuf::from(".gitignore"),
+            PathBuf::from("nested/untracked.rs"),
+            PathBuf::from("visible.txt"),
+        ]
+    );
+
+    let commit = repo.prospective_commit(CommitMode::Normal)?;
+    let prompt = crate::generation::Prompt::new(&repo, &[], &commit, 10_000)?;
+    assert!(prompt.text.contains("## Working-tree layout"));
+    assert!(prompt.text.contains("nested/\n  untracked.rs"));
+    assert!(!prompt.text.contains("secret.txt"));
+    assert!(!prompt.text.contains("ignored-directory"));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn working_tree_context_does_not_follow_directory_symlinks() -> Result<()> {
+    use std::os::unix::fs::symlink;
+
+    let fixture = Fixture::new()?;
+    fixture.write("target/file.txt", "contents\n")?;
+    symlink("target", fixture.path.join("linked"))?;
+    let repo = fixture.git_repo()?;
+
+    assert_eq!(
+        repo.working_tree_files()?,
+        [PathBuf::from("linked"), PathBuf::from("target/file.txt")]
+    );
+    Ok(())
+}
+
+#[test]
 fn deletion_has_only_before_version() -> Result<()> {
     let fixture = Fixture::new()?;
     fixture.write_and_stage("deleted.txt", "one\ntwo\n")?;

@@ -7,7 +7,7 @@ Unlike tools that simply summarize `git diff`,
 It combines the staged diff with a small amount of relevant context, including:
 
 * the repository `README.md`
-* the repository directory structure
+* the working-tree directory structure, excluding Git-ignored entries
 * changed files
 * branch and recent commit history
 * Tree-sitter AST context around changed code

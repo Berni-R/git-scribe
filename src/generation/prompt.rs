@@ -1,4 +1,9 @@
-use std::{fmt::Write as _, fs, path::Path};
+use std::{
+    ffi::{OsStr, OsString},
+    fmt::Write as _,
+    fs,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context as _, Result, bail};
 
@@ -39,6 +44,9 @@ const MAX_README_CONTEXT_TOKENS: usize = 1_500;
 /// Maximum prompt space used for tree-sitter-derived structural evidence.
 const MAX_SYNTAX_CONTEXT_TOKENS: usize = 2_000;
 
+/// Maximum number of non-ignored working-tree files shown as repository structure.
+const MAX_WORKING_TREE_FILES: usize = 500;
+
 /// Context capacity deliberately left unused by our raw-message budget.
 ///
 /// Ollama tokenizes the rendered chat template, not simply `SYSTEM + prompt`,
@@ -58,6 +66,8 @@ Use the supplied information according to its role:
 - The complete commit diff is the source of truth for what changed.
 - Author-provided context may establish intent, motivation, or background that is not apparent from the diff,
   but must not override what the diff actually does.
+- The working-tree layout provides repository structure and may contain untracked paths;
+  it is not evidence that a path is part of the commit.
 - The branch name may provide weak evidence about intent.
 - Recent commit subjects are evidence for commit-message style and terminology;
   do not attribute their changes to the current commit.
@@ -94,6 +104,7 @@ that is fully supported.
         token_budget: usize,
     ) -> Result<Self> {
         let branch = branch_text(repo)?;
+        let working_tree = working_tree_text(repo)?;
         let history = commit_history_text(repo, commit.mode())?;
         let commit_files = file_change_status_text(commit.changes());
         let commit_stats = commit.stats().to_string();
@@ -104,6 +115,7 @@ that is fully supported.
         // If this alone does not fit, the commit should be split rather than silently dropping part of the diff.
         let minimal = render_prompt(PromptParts {
             branch: &branch,
+            working_tree: &working_tree,
             history: &history,
             commit_files: &commit_files,
             commit_stats: &commit_stats,
@@ -133,6 +145,7 @@ that is fully supported.
         let syntax_context = (!syntax_contexts.is_empty()).then_some(syntax_contexts.as_slice());
         let with_syntax = render_prompt(PromptParts {
             branch: &branch,
+            working_tree: &working_tree,
             history: &history,
             commit_files: &commit_files,
             commit_stats: &commit_stats,
@@ -152,6 +165,7 @@ that is fully supported.
 
         let text = render_prompt(PromptParts {
             branch: &branch,
+            working_tree: &working_tree,
             history: &history,
             commit_files: &commit_files,
             commit_stats: &commit_stats,
@@ -211,6 +225,7 @@ that is fully supported.
 #[derive(Clone, Copy)]
 struct PromptParts<'a> {
     branch: &'a str,
+    working_tree: &'a str,
     history: &'a str,
     commit_files: &'a str,
     commit_stats: &'a str,
@@ -243,6 +258,7 @@ fn render_prompt(parts: PromptParts<'_>) -> String {
     let syntax_context = syntax_context_section(parts.syntax_context);
     let PromptParts {
         branch,
+        working_tree,
         history,
         commit_files,
         commit_stats,
@@ -256,6 +272,12 @@ fn render_prompt(parts: PromptParts<'_>) -> String {
 
 ## Branch
 {branch}
+
+## Working-tree layout
+Git-ignored entries are omitted. Paths describe repository structure, not commit membership.
+````text
+{working_tree}
+````
 
 ## Recent commit subjects
 {history}
@@ -291,19 +313,11 @@ fn syntax_contexts(repo: &GitRepo, changes: &[CommitChange]) -> Result<Vec<Synta
     Ok(contexts)
 }
 
-/// Keep complete high-value file contexts within the global supporting-evidence budget.
+/// Keep complete file contexts in commit order within the global supporting-evidence budget.
 fn select_syntax_contexts(contexts: Vec<SyntaxContext>, budget: usize) -> Vec<SyntaxContext> {
-    let mut ranked = contexts.into_iter().enumerate().collect::<Vec<_>>();
-    ranked.sort_by(|(left_index, left), (right_index, right)| {
-        right
-            .priority()
-            .cmp(&left.priority())
-            .then_with(|| left_index.cmp(right_index))
-    });
-
     let mut selected = Vec::new();
     let mut rendered = String::new();
-    for (index, context) in ranked {
+    for context in contexts {
         let block = render_syntax_context(&context);
         let candidate = if rendered.is_empty() {
             block
@@ -312,12 +326,11 @@ fn select_syntax_contexts(contexts: Vec<SyntaxContext>, budget: usize) -> Vec<Sy
         };
         if estimate_tokens(&syntax_context_section_text(&candidate)) <= budget {
             rendered = candidate;
-            selected.push((index, context));
+            selected.push(context);
         }
     }
 
-    selected.sort_by_key(|(index, _)| *index);
-    selected.into_iter().map(|(_, context)| context).collect()
+    selected
 }
 
 fn syntax_context_section(contexts: Option<&[SyntaxContext]>) -> String {
@@ -412,6 +425,61 @@ fn render_entries(output: &mut String, entries: &[SyntaxEntry]) {
         }
         previous = &entry.items;
     }
+}
+
+/// Render the visible working-tree files as a compact directory hierarchy.
+fn working_tree_text(repo: &GitRepo) -> Result<String> {
+    let files = repo.working_tree_files()?;
+    let shown = files.len().min(MAX_WORKING_TREE_FILES);
+    let mut output = render_working_tree(&files[..shown]);
+
+    if files.len() > shown {
+        let _ = writeln!(output, "... ({} more files omitted)", files.len() - shown);
+    }
+
+    Ok(output)
+}
+
+fn render_working_tree(files: &[PathBuf]) -> String {
+    if files.is_empty() {
+        return "(working tree is empty)".to_owned();
+    }
+
+    let mut output = String::new();
+    let mut previous = Vec::<OsString>::new();
+    for file in files {
+        let components = file.iter().collect::<Vec<_>>();
+        let common = previous
+            .iter()
+            .zip(&components)
+            .take_while(|(left, right)| left.as_os_str() == **right)
+            .count();
+
+        for (depth, component) in components.iter().enumerate().skip(common) {
+            let directory_suffix = if depth + 1 == components.len() {
+                ""
+            } else {
+                "/"
+            };
+            let _ = writeln!(
+                output,
+                "{}{}{directory_suffix}",
+                "  ".repeat(depth),
+                display_path_component(component)
+            );
+        }
+
+        previous = components.into_iter().map(OsStr::to_os_string).collect();
+    }
+
+    output.trim_end().to_owned()
+}
+
+fn display_path_component(component: &OsStr) -> String {
+    component
+        .to_string_lossy()
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
 }
 
 /// Name the current branch or detached HEAD mode.
@@ -545,8 +613,8 @@ mod tests {
     }
 
     #[test]
-    fn global_budget_prefers_higher_value_context() {
-        let low = SyntaxContext {
+    fn global_budget_keeps_complete_contexts_in_commit_order() {
+        let first = SyntaxContext {
             language: crate::syntax::Language::Json,
             before: None,
             after: Some(side(
@@ -554,7 +622,7 @@ mod tests {
                 vec![item(SyntaxKind::Other, "\"timeout\":", 1)],
             )),
         };
-        let high = SyntaxContext {
+        let second = SyntaxContext {
             language: crate::syntax::Language::Rust,
             before: None,
             after: Some(side(
@@ -562,13 +630,35 @@ mod tests {
                 vec![item(SyntaxKind::Function, "fn request()", 1)],
             )),
         };
-        let budget = estimate_tokens(&syntax_context_section_text(&render_syntax_context(&high)));
+        let budget = estimate_tokens(&syntax_context_section_text(&render_syntax_context(&first)));
 
-        let selected = select_syntax_contexts(vec![low, high], budget);
+        let selected = select_syntax_contexts(vec![first, second], budget);
         assert_eq!(selected.len(), 1);
         assert_eq!(
             selected[0].after.as_ref().unwrap().path,
-            Path::new("src/client.rs")
+            Path::new("config.json")
+        );
+    }
+
+    #[test]
+    fn working_tree_renderer_compacts_common_directories() {
+        let files = [
+            PathBuf::from("README.md"),
+            PathBuf::from("src/git/mod.rs"),
+            PathBuf::from("src/main.rs"),
+        ];
+
+        assert_eq!(
+            render_working_tree(&files),
+            "README.md\nsrc/\n  git/\n    mod.rs\n  main.rs"
+        );
+    }
+
+    #[test]
+    fn working_tree_renderer_escapes_line_breaks_in_paths() {
+        assert_eq!(
+            render_working_tree(&[PathBuf::from("line\nbreak.rs")]),
+            "line\\nbreak.rs"
         );
     }
 }

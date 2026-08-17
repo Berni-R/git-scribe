@@ -12,9 +12,7 @@ use super::Language;
 
 const MAX_ENTRIES_PER_SIDE: usize = 12;
 const MAX_ITEMS_PER_ENTRY: usize = 4;
-const MAX_CANDIDATE_ENTRIES: usize = 64;
 const MAX_DECLARATION_BYTES: usize = 400;
-const MAX_CONTEXT_BYTES_PER_SIDE: usize = 2_400;
 
 /// Language-independent role of source-derived syntax evidence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,19 +28,6 @@ pub enum SyntaxKind {
     Import,
     ControlFlow,
     Other,
-}
-
-impl SyntaxKind {
-    pub(crate) const fn priority(self) -> u8 {
-        match self {
-            Self::Test => 100,
-            Self::Method | Self::Function => 90,
-            Self::Field | Self::Constant | Self::Import => 80,
-            Self::Impl | Self::Type | Self::Module => 70,
-            Self::ControlFlow => 40,
-            Self::Other => 20,
-        }
-    }
 }
 
 /// One useful source-derived construct associated with changed lines.
@@ -63,16 +48,6 @@ pub struct SyntaxEntry {
     pub items: Vec<SyntaxItem>,
 }
 
-impl SyntaxEntry {
-    pub(crate) fn priority(&self) -> u8 {
-        self.items
-            .iter()
-            .map(|item| item.kind.priority())
-            .max()
-            .unwrap_or_default()
-    }
-}
-
 /// Structural evidence for one available side of a changed file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyntaxSide {
@@ -86,18 +61,6 @@ pub struct SyntaxContext {
     pub language: Language,
     pub before: Option<SyntaxSide>,
     pub after: Option<SyntaxSide>,
-}
-
-impl SyntaxContext {
-    pub(crate) fn priority(&self) -> u8 {
-        self.before
-            .iter()
-            .chain(&self.after)
-            .flat_map(|side| &side.entries)
-            .map(SyntaxEntry::priority)
-            .max()
-            .unwrap_or_default()
-    }
 }
 
 /// Extract Tree-sitter context for one owned prospective-commit change.
@@ -211,67 +174,18 @@ pub fn context_for_ranges(
             let Some(focus) = focus_on_row(root, &lines, row) else {
                 continue;
             };
-            let nodes = semantic_ancestors(focus, language);
-            if nodes.is_empty() {
+            let (key, entry) = syntax_entry(source, focus, language, row);
+            if entry.items.is_empty() || !seen.insert(key) {
                 continue;
             }
-            let key = nodes
-                .iter()
-                .map(|node| (node.start_byte(), node.end_byte()))
-                .collect::<Vec<_>>();
-            if !seen.insert(key) {
-                continue;
-            }
-
-            let items = nodes
-                .into_iter()
-                .filter_map(|node| syntax_item(source, node, language))
-                .collect::<Vec<_>>();
-            if items.is_empty() {
-                continue;
-            }
-            entries.push(SyntaxEntry { items });
-            if entries.len() == MAX_CANDIDATE_ENTRIES {
+            entries.push(entry);
+            if entries.len() == MAX_ENTRIES_PER_SIDE {
                 break 'ranges;
             }
         }
     }
 
-    Ok(select_entries(entries))
-}
-
-fn select_entries(mut entries: Vec<SyntaxEntry>) -> Vec<SyntaxEntry> {
-    entries.sort_by(|left, right| {
-        right
-            .priority()
-            .cmp(&left.priority())
-            .then_with(|| entry_start_line(left).cmp(&entry_start_line(right)))
-    });
-
-    let mut selected = Vec::new();
-    let mut bytes = 0;
-    for entry in entries {
-        let entry_bytes = entry
-            .items
-            .iter()
-            .map(|item| item.declaration.len())
-            .sum::<usize>();
-        if selected.len() < MAX_ENTRIES_PER_SIDE
-            && bytes + entry_bytes <= MAX_CONTEXT_BYTES_PER_SIDE
-        {
-            bytes += entry_bytes;
-            selected.push(entry);
-        }
-    }
-    selected.sort_by_key(entry_start_line);
-    selected
-}
-
-fn entry_start_line(entry: &SyntaxEntry) -> usize {
-    entry
-        .items
-        .last()
-        .map_or(usize::MAX, |item| item.start_line)
+    Ok(entries)
 }
 
 fn changed_rows(range: LineRange, line_count: usize) -> impl Iterator<Item = usize> {
@@ -291,61 +205,46 @@ fn focus_on_row<'tree>(root: Node<'tree>, lines: &[&[u8]], row: usize) -> Option
     root.named_descendant_for_point_range(point, point)
 }
 
-fn semantic_ancestors(focus: Node<'_>, language: Language) -> Vec<Node<'_>> {
-    let mut nodes = Vec::new();
+fn syntax_entry(
+    source: &[u8],
+    focus: Node<'_>,
+    language: Language,
+    changed_row: usize,
+) -> (Vec<(usize, usize)>, SyntaxEntry) {
+    let mut items = Vec::new();
     let mut current = Some(focus);
     while let Some(node) = current {
-        if semantic_kinds(language).contains(&node.kind()) {
-            nodes.push(node);
+        if let Some(item) = syntax_item(source, node, language)
+            && (item.kind != SyntaxKind::ControlFlow || control_header_contains(node, changed_row))
+        {
+            items.push((node.start_byte(), node.end_byte(), item));
         }
         current = node.parent();
     }
-    nodes.reverse();
-
-    if nodes.len() <= MAX_ITEMS_PER_ENTRY {
-        return nodes;
+    if items.len() > MAX_ITEMS_PER_ENTRY {
+        items.truncate(MAX_ITEMS_PER_ENTRY);
     }
+    items.reverse();
 
-    let local = nodes
-        .last()
-        .copied()
-        .filter(|node| is_control_kind(node.kind()));
-    let primary_limit = MAX_ITEMS_PER_ENTRY - usize::from(local.is_some());
-    let mut primary = nodes
-        .into_iter()
-        .filter(|node| !is_control_kind(node.kind()))
-        .collect::<Vec<_>>();
-    if primary.len() > primary_limit {
-        primary.drain(..primary.len() - primary_limit);
-    }
-    primary.extend(local);
-    primary
+    let key = items.iter().map(|(start, end, _)| (*start, *end)).collect();
+    let items = items.into_iter().map(|(_, _, item)| item).collect();
+    (key, SyntaxEntry { items })
 }
 
-fn is_control_kind(kind: &str) -> bool {
-    matches!(
-        kind,
-        "if_expression"
-            | "match_expression"
-            | "for_expression"
-            | "while_expression"
-            | "loop_expression"
-            | "closure_expression"
-            | "if_statement"
-            | "for_statement"
-            | "while_statement"
-            | "switch_statement"
-            | "with_statement"
-            | "match_statement"
-            | "case_statement"
-    )
+fn control_header_contains(node: Node<'_>, changed_row: usize) -> bool {
+    let header_end = ["body", "consequence"]
+        .into_iter()
+        .find_map(|field| node.child_by_field_name(field))
+        .map_or(node.start_position().row, |body| body.start_position().row);
+
+    (node.start_position().row..=header_end).contains(&changed_row)
 }
 
 fn syntax_item(source: &[u8], node: Node<'_>, language: Language) -> Option<SyntaxItem> {
     let (start, start_line) = declaration_start(node, language);
     let end = declaration_end(node, language);
     let declaration = compact_source(source.get(start..end)?)?;
-    let kind = syntax_kind(node, &declaration);
+    let kind = syntax_kind(node, language, &declaration)?;
 
     Some(SyntaxItem {
         kind,
@@ -354,68 +253,141 @@ fn syntax_item(source: &[u8], node: Node<'_>, language: Language) -> Option<Synt
     })
 }
 
-fn syntax_kind(node: Node<'_>, declaration: &str) -> SyntaxKind {
-    let node_kind = node.kind();
-    if is_control_kind(node_kind) {
-        return SyntaxKind::ControlFlow;
-    }
+#[allow(clippy::too_many_lines)] // One declarative mapping keeps grammar knowledge in one place.
+fn syntax_kind(node: Node<'_>, language: Language, declaration: &str) -> Option<SyntaxKind> {
+    let kind = match (language, node.kind()) {
+        (Language::Rust, "mod_item")
+        | (Language::Cpp, "namespace_definition")
+        | (Language::TypeScript | Language::Tsx, "internal_module")
+        | (Language::Toml, "table" | "table_array_element") => SyntaxKind::Module,
 
-    match node_kind {
-        "mod_item"
-        | "namespace_definition"
-        | "internal_module"
-        | "table"
-        | "table_array_element" => SyntaxKind::Module,
-        "struct_item"
-        | "enum_item"
-        | "union_item"
-        | "trait_item"
-        | "type_item"
-        | "class_specifier"
-        | "struct_specifier"
-        | "union_specifier"
-        | "enum_specifier"
-        | "class_definition"
-        | "class_declaration"
-        | "struct_declaration"
-        | "enum_declaration"
-        | "protocol_declaration"
-        | "interface_declaration"
-        | "type_alias_declaration"
-        | "abstract_class_declaration" => SyntaxKind::Type,
-        "impl_item" | "extension_declaration" => SyntaxKind::Impl,
-        "field_declaration" | "property_declaration" | "pair" => SyntaxKind::Field,
-        "const_item" | "static_item" => SyntaxKind::Constant,
-        "use_declaration"
-        | "preproc_include"
-        | "import_statement"
-        | "import_from_statement"
-        | "import_declaration" => SyntaxKind::Import,
-        "method_definition"
-        | "method_signature"
-        | "initializer_declaration"
-        | "subscript_declaration" => SyntaxKind::Method,
-        "function_item" | "function_signature_item" if is_rust_test(declaration) => {
+        (
+            Language::Rust,
+            "struct_item" | "enum_item" | "union_item" | "trait_item" | "type_item",
+        )
+        | (
+            Language::C | Language::Cpp,
+            "struct_specifier" | "union_specifier" | "enum_specifier",
+        )
+        | (Language::Cpp, "class_specifier")
+        | (Language::Python, "class_definition")
+        | (
+            Language::Swift,
+            "class_declaration"
+            | "struct_declaration"
+            | "enum_declaration"
+            | "protocol_declaration",
+        )
+        | (Language::JavaScript, "class_declaration")
+        | (
+            Language::TypeScript | Language::Tsx,
+            "class_declaration"
+            | "abstract_class_declaration"
+            | "interface_declaration"
+            | "type_alias_declaration"
+            | "enum_declaration",
+        ) => SyntaxKind::Type,
+
+        (Language::Rust, "impl_item") | (Language::Swift, "extension_declaration") => {
+            SyntaxKind::Impl
+        }
+
+        (Language::Rust, "field_declaration")
+        | (Language::Swift, "property_declaration")
+        | (Language::Toml | Language::Json, "pair") => SyntaxKind::Field,
+
+        (Language::Rust, "const_item" | "static_item") => SyntaxKind::Constant,
+
+        (Language::Rust, "use_declaration")
+        | (Language::C | Language::Cpp, "preproc_include")
+        | (Language::Python, "import_statement" | "import_from_statement")
+        | (Language::Swift, "import_declaration")
+        | (Language::JavaScript | Language::TypeScript | Language::Tsx, "import_statement") => {
+            SyntaxKind::Import
+        }
+
+        (Language::Rust, "function_item" | "function_signature_item")
+            if is_rust_test(declaration) =>
+        {
             SyntaxKind::Test
         }
-        "function_item"
-        | "function_signature_item"
-        | "function_definition"
-        | "function_declaration"
-            if has_method_parent(node) =>
-        {
-            SyntaxKind::Method
-        }
-        "function_item"
-        | "function_signature_item"
-        | "function_definition"
-        | "function_declaration"
-        | "generator_function_declaration"
-        | "function_expression"
-        | "generator_function"
-        | "arrow_function" => SyntaxKind::Function,
-        _ => SyntaxKind::Other,
-    }
+
+        (Language::Swift, "initializer_declaration" | "subscript_declaration")
+        | (Language::JavaScript | Language::TypeScript | Language::Tsx, "method_definition")
+        | (Language::TypeScript | Language::Tsx, "method_signature") => SyntaxKind::Method,
+
+        (Language::Rust, "function_item" | "function_signature_item")
+        | (
+            Language::C | Language::Cpp | Language::Python | Language::Bash,
+            "function_definition",
+        )
+        | (Language::Swift, "function_declaration")
+        | (
+            Language::JavaScript | Language::TypeScript | Language::Tsx,
+            "function_declaration"
+            | "generator_function_declaration"
+            | "function_expression"
+            | "generator_function"
+            | "arrow_function",
+        ) if has_method_parent(node) => SyntaxKind::Method,
+
+        (Language::Rust, "function_item" | "function_signature_item")
+        | (
+            Language::C | Language::Cpp | Language::Python | Language::Bash,
+            "function_definition",
+        )
+        | (Language::Swift, "function_declaration")
+        | (
+            Language::JavaScript | Language::TypeScript | Language::Tsx,
+            "function_declaration"
+            | "generator_function_declaration"
+            | "function_expression"
+            | "generator_function"
+            | "arrow_function",
+        ) => SyntaxKind::Function,
+
+        (
+            Language::Rust,
+            "if_expression" | "match_expression" | "for_expression" | "while_expression"
+            | "loop_expression",
+        )
+        | (
+            Language::C
+            | Language::Cpp
+            | Language::Swift
+            | Language::JavaScript
+            | Language::TypeScript
+            | Language::Tsx,
+            "if_statement" | "for_statement" | "while_statement" | "switch_statement",
+        )
+        | (
+            Language::Python,
+            "if_statement" | "for_statement" | "while_statement" | "with_statement"
+            | "match_statement",
+        )
+        | (
+            Language::Bash,
+            "if_statement" | "for_statement" | "while_statement" | "case_statement",
+        ) => SyntaxKind::ControlFlow,
+
+        (Language::Rust, "enum_variant")
+        | (Language::C | Language::Cpp, "declaration")
+        | (Language::Cpp, "template_declaration")
+        | (Language::Python, "decorated_definition")
+        | (
+            Language::Css,
+            "rule_set"
+            | "media_statement"
+            | "supports_statement"
+            | "scope_statement"
+            | "keyframes_statement",
+        )
+        | (Language::Html, "element" | "script_element" | "style_element") => SyntaxKind::Other,
+
+        _ => return None,
+    };
+
+    Some(kind)
 }
 
 fn has_method_parent(node: Node<'_>) -> bool {
@@ -500,140 +472,6 @@ fn compact_source(source: &[u8]) -> Option<String> {
     let declaration = source.trim().trim_end_matches('{').trim();
     (!declaration.is_empty() && declaration.len() <= MAX_DECLARATION_BYTES)
         .then(|| declaration.to_owned())
-}
-
-#[allow(clippy::too_many_lines)] // This is a declarative grammar-node lookup table.
-fn semantic_kinds(language: Language) -> &'static [&'static str] {
-    match language {
-        Language::Rust => &[
-            "mod_item",
-            "impl_item",
-            "trait_item",
-            "function_item",
-            "function_signature_item",
-            "struct_item",
-            "enum_item",
-            "union_item",
-            "field_declaration",
-            "enum_variant",
-            "const_item",
-            "static_item",
-            "type_item",
-            "use_declaration",
-            "if_expression",
-            "match_expression",
-            "for_expression",
-            "while_expression",
-            "loop_expression",
-            "closure_expression",
-        ],
-        Language::C => &[
-            "function_definition",
-            "struct_specifier",
-            "union_specifier",
-            "enum_specifier",
-            "declaration",
-            "preproc_include",
-            "if_statement",
-            "for_statement",
-            "while_statement",
-            "switch_statement",
-        ],
-        Language::Cpp => &[
-            "namespace_definition",
-            "class_specifier",
-            "struct_specifier",
-            "union_specifier",
-            "enum_specifier",
-            "template_declaration",
-            "function_definition",
-            "declaration",
-            "preproc_include",
-            "if_statement",
-            "for_statement",
-            "while_statement",
-            "switch_statement",
-        ],
-        Language::Python => &[
-            "class_definition",
-            "decorated_definition",
-            "function_definition",
-            "import_statement",
-            "import_from_statement",
-            "if_statement",
-            "for_statement",
-            "while_statement",
-            "with_statement",
-            "match_statement",
-        ],
-        Language::Swift => &[
-            "class_declaration",
-            "struct_declaration",
-            "enum_declaration",
-            "protocol_declaration",
-            "extension_declaration",
-            "function_declaration",
-            "initializer_declaration",
-            "subscript_declaration",
-            "property_declaration",
-            "import_declaration",
-            "if_statement",
-            "for_statement",
-            "while_statement",
-            "switch_statement",
-        ],
-        Language::Bash => &[
-            "function_definition",
-            "if_statement",
-            "for_statement",
-            "while_statement",
-            "case_statement",
-        ],
-        Language::JavaScript => &[
-            "class_declaration",
-            "function_declaration",
-            "generator_function_declaration",
-            "method_definition",
-            "function_expression",
-            "generator_function",
-            "arrow_function",
-            "import_statement",
-            "if_statement",
-            "for_statement",
-            "while_statement",
-            "switch_statement",
-        ],
-        Language::TypeScript | Language::Tsx => &[
-            "internal_module",
-            "class_declaration",
-            "abstract_class_declaration",
-            "interface_declaration",
-            "type_alias_declaration",
-            "enum_declaration",
-            "function_declaration",
-            "generator_function_declaration",
-            "method_definition",
-            "method_signature",
-            "function_expression",
-            "generator_function",
-            "arrow_function",
-            "import_statement",
-            "if_statement",
-            "for_statement",
-            "while_statement",
-            "switch_statement",
-        ],
-        Language::Css => &[
-            "rule_set",
-            "media_statement",
-            "supports_statement",
-            "scope_statement",
-            "keyframes_statement",
-        ],
-        Language::Html => &["element", "script_element", "style_element"],
-        Language::Toml => &["table", "table_array_element", "pair"],
-        Language::Json => &["pair"],
-    }
 }
 
 #[cfg(test)]
@@ -759,14 +597,29 @@ mod tests {
     }
 
     #[test]
-    fn deeply_nested_control_flow_retains_method_and_impl() {
+    fn enclosing_control_flow_does_not_obscure_method_and_impl() {
         let source = "impl Client {\n    fn request(&self) {\n        if ready() {\n            for item in items() {\n                while active() {\n                    changed();\n                }\n            }\n        }\n    }\n}\n";
         let entries = rust_context(source, &[(6, 1)]);
-        let declarations = declarations(&entries[0]);
 
-        assert!(declarations.contains(&"impl Client"));
-        assert!(declarations.contains(&"fn request(&self)"));
-        assert!(declarations.iter().any(|scope| scope.starts_with("while ")));
+        assert_eq!(
+            declarations(&entries[0]),
+            ["impl Client", "fn request(&self)"]
+        );
+    }
+
+    #[test]
+    fn changed_control_flow_header_is_included() {
+        let source = "fn request() {\n    if timeout > 30 {\n        retry();\n    }\n}\n";
+        let entries = rust_context(source, &[(2, 1)]);
+
+        assert_eq!(
+            kinds(&entries[0]),
+            [SyntaxKind::Function, SyntaxKind::ControlFlow]
+        );
+        assert_eq!(
+            declarations(&entries[0]),
+            ["fn request()", "if timeout > 30"]
+        );
     }
 
     #[test]

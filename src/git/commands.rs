@@ -1,4 +1,8 @@
-use std::path::Path;
+use std::{
+    ffi::OsStr,
+    fs,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context as _, Result, bail};
 use git2::{
@@ -132,6 +136,68 @@ impl GitRepo {
         self.blob(entry.id)
             .map(Some)
             .with_context(|| format!("failed to read indexed file {}", path.as_ref().display()))
+    }
+
+    /// Return the files visible in the working tree after applying Git ignore rules.
+    ///
+    /// Git metadata is excluded and symbolic links are returned as files rather than followed.
+    pub fn working_tree_files(&self) -> Result<Vec<PathBuf>> {
+        let mut files = Vec::new();
+        self.collect_working_tree_files(Path::new(""), &mut files)?;
+        files.sort();
+        Ok(files)
+    }
+
+    fn collect_working_tree_files(
+        &self,
+        relative_directory: &Path,
+        files: &mut Vec<PathBuf>,
+    ) -> Result<()> {
+        let directory = self.root().join(relative_directory);
+        let mut entries = fs::read_dir(&directory)
+            .with_context(|| {
+                format!(
+                    "failed to read working-tree directory {}",
+                    directory.display()
+                )
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        entries.sort_by_key(fs::DirEntry::file_name);
+
+        for entry in entries {
+            let name = entry.file_name();
+            if name == OsStr::new(".git") {
+                continue;
+            }
+
+            let relative_path = relative_directory.join(name);
+            if self
+                .repository()
+                .status_should_ignore(&relative_path)
+                .with_context(|| {
+                    format!(
+                        "failed to apply Git ignore rules to {}",
+                        relative_path.display()
+                    )
+                })?
+            {
+                continue;
+            }
+
+            let file_type = entry.file_type().with_context(|| {
+                format!(
+                    "failed to inspect working-tree entry {}",
+                    relative_path.display()
+                )
+            })?;
+            if file_type.is_dir() {
+                self.collect_working_tree_files(&relative_path, files)?;
+            } else {
+                files.push(relative_path);
+            }
+        }
+
+        Ok(())
     }
 
     fn prospective_diff(&self, mode: CommitMode) -> Result<Diff<'_>> {
