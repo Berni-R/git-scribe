@@ -1,13 +1,14 @@
 use std::{path::PathBuf, time::Duration};
 
 use clap::Parser;
-use git_sight::{git::CommitMode, ollama::Think};
+use git_synopsis::{git::CommitMode, ollama::Think};
 
 #[derive(Debug, Parser)]
 #[command(
     version,
-    about = "Generate a commit message and open it in Git's commit editor"
+    about = "Generate a commit message, then open it in Git's editor or print it"
 )]
+#[allow(clippy::struct_excessive_bools)] // Independent command-line switches are naturally boolean.
 pub struct Cli {
     /// Repository to inspect.
     #[arg(value_name = "PATH", default_value = ".")]
@@ -21,25 +22,29 @@ pub struct Cli {
     #[arg(long, value_name = "TEXT")]
     pub context: Vec<String>,
 
-    /// Ollama model to use (e.g. "gemma4:e2b", "qwen3.5:4b", "qwen3:4b-instruct", "mistral:7b").
+    /// Ollama model to use (e.g. "gemma4:e2b" or "qwen3:4b-instruct").
     ///
     /// Note:
     /// As of now (Aug 2026), models using Apple MLX framework do not respect the output format with Ollama.
     ///
     /// See <https://github.com/ollama/ollama/issues/16563>.
-    #[arg(long, default_value = "qwen3.5:4b")]
+    #[arg(short, long, default_value = "qwen3.5:9b")]
     pub model: String,
 
-    /// Prefill the commit editor with only the generated one-line subject.
+    /// Use only the generated one-line subject, omitting the body.
     #[arg(short, long)]
     pub no_body: bool,
+
+    /// Print the generated message instead of creating a commit.
+    #[arg(short, long)]
+    pub print: bool,
 
     /// Model context window, in tokens.
     #[arg(short = 'c', long, default_value_t = 16_384)]
     pub model_context: u32,
 
     /// Sampling temperature used by the model.
-    #[arg(long, default_value_t = 0.15)]
+    #[arg(short, long, default_value_t = 0.0)]
     pub temperature: f32,
 
     /// Random seed used for reproducible outputs, if given.
@@ -54,7 +59,7 @@ pub struct Cli {
     ///
     /// A value of `0` unloads the model immediately.
     /// If not specified, use the Ollama default.
-    #[arg(long, value_parser = humantime::parse_duration)]
+    #[arg(short, long, value_parser = humantime::parse_duration)]
     pub keep_alive: Option<Duration>,
 
     /// Print the model's structured analysis to stderr.
@@ -86,5 +91,18 @@ impl Cli {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn print_flag_selects_print_only_mode() {
+        let cli = Cli::try_parse_from(["git-synopsis", "--print"]).unwrap();
+
+        assert!(cli.print);
+        assert!(!cli.amend);
     }
 }

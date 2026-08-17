@@ -20,8 +20,10 @@ struct Fixture {
 impl Fixture {
     fn new() -> Result<Self> {
         let sequence = NEXT_REPOSITORY.fetch_add(1, Ordering::Relaxed);
-        let path =
-            std::env::temp_dir().join(format!("git-sight-test-{}-{sequence}", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "git-synopsis-test-{}-{sequence}",
+            std::process::id()
+        ));
         fs::create_dir(&path)?;
         let repository = Repository::init(&path)?;
         repository.set_head("refs/heads/main")?;
@@ -55,7 +57,7 @@ impl Fixture {
 
     fn configure_cli_commit(&self) -> Result<()> {
         let mut config = self.repository.config()?;
-        config.set_str("user.name", "Git Sight Tests")?;
+        config.set_str("user.name", "Git Synopsis Tests")?;
         config.set_str("user.email", "tests@example.com")?;
         config.set_str("core.editor", "true")?;
         config.set_bool("commit.gpgsign", false)?;
@@ -96,7 +98,7 @@ impl Fixture {
     ) -> Result<Oid> {
         let tree_id = self.repository.index()?.write_tree()?;
         let tree = self.repository.find_tree(tree_id)?;
-        let signature = Signature::now("Git Sight Tests", "tests@example.com")?;
+        let signature = Signature::now("Git Synopsis Tests", "tests@example.com")?;
         let parents = parent_ids
             .iter()
             .map(|id| self.repository.find_commit(*id))

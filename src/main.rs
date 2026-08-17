@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
 use clap::Parser as _;
-use git_sight::{
+use git_synopsis::{
     GitRepo,
     generation::{CommitMessage, Confidence, Prompt},
     ollama::{self, ChatOptions, KeepAlive, Message, ModelOptions, Role},
@@ -47,7 +47,7 @@ fn main() -> Result<()> {
     let prompt = Prompt::new(&repo, &args.context, &commit, prompt_token_budget)?;
 
     eprintln!(
-        "git-sight: {} file(s) in commit, ~{}/{} (~{:.0}%) prompt tokens used, {}",
+        "git-synopsis: {} file(s) in commit, ~{}/{} (~{:.0}%) prompt tokens used, {}",
         commit.len(),
         prompt.estimated_tokens,
         prompt_token_budget,
@@ -57,7 +57,7 @@ fn main() -> Result<()> {
 
     if let Some(path) = &args.context_file {
         prompt.write_context(path)?;
-        eprintln!("git-sight: wrote model context to {}", path.display());
+        eprintln!("git-synopsis: wrote model context to {}", path.display());
     }
 
     let client = ollama::Client::default();
@@ -93,11 +93,11 @@ fn main() -> Result<()> {
     )?;
 
     if let Some(actual) = response.prompt_eval_count {
-        eprintln!("git-sight: Ollama actually used {actual} prompt tokens");
+        eprintln!("git-synopsis: Ollama actually used {actual} prompt tokens");
     }
 
     eprintln!(
-        "git-sight: Ollama generated {} tokens, done reason: {:?}",
+        "git-synopsis: Ollama generated {} tokens, done reason: {:?}",
         response.eval_count.unwrap_or(0),
         response.done_reason,
     );
@@ -106,7 +106,7 @@ fn main() -> Result<()> {
         && !thinking.is_empty()
     {
         eprintln!(
-            "git-sight: model produced {} bytes of thinking",
+            "git-synopsis: model produced {} bytes of thinking",
             thinking.len(),
         );
     }
@@ -134,17 +134,17 @@ fn main() -> Result<()> {
     };
 
     if response.done_reason.as_deref() == Some("length") {
-        eprintln!("git-sight: warning: model output hit the token limit");
+        eprintln!("git-synopsis: warning: model output hit the token limit");
     }
     if matches!(answer.confidence, Confidence::Low) {
         eprintln!(
-            "git-sight: warning: model reports low confidence ({:?}): {}",
+            "git-synopsis: warning: model reports low confidence ({:?}): {}",
             answer.change_kind, answer.intent,
         );
     }
 
     if args.show_analysis {
-        eprintln!("git-sight: model analysis:");
+        eprintln!("git-synopsis: model analysis:");
         eprintln!("  intent: {}", answer.intent);
         eprintln!("  kind: {:?}", answer.change_kind);
         eprintln!("  confidence: {:?}", answer.confidence);
@@ -166,8 +166,12 @@ fn main() -> Result<()> {
         commit_message.push_str(body);
     }
 
-    eprintln!("git-sight: opening the Git commit editor");
-    repo.commit_interactively(mode, &commit_message)?;
+    if args.print {
+        println!("{commit_message}");
+    } else {
+        eprintln!("git-synopsis: opening the Git commit editor");
+        repo.commit_interactively(mode, &commit_message)?;
+    }
 
     Ok(())
 }

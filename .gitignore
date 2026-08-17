@@ -1,3 +1,6 @@
+# typical context output
+context.md
+
 # compiled / distribute directories
 build/
 dist/

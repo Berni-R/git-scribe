@@ -254,8 +254,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "git-sight"
-version = "0.1.3"
+name = "git-synopsis"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
