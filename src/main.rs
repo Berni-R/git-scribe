@@ -1,12 +1,14 @@
 #![warn(clippy::pedantic)]
 #![allow(clippy::missing_errors_doc)]
 
+use std::io::Write as _;
+
 use anyhow::{Context as _, Result, bail};
 use clap::Parser as _;
 use git_scribe::{
     GitRepo,
     generation::{CommitMessage, Confidence, Prompt},
-    ollama::{self, ChatOptions, KeepAlive, Message, ModelOptions, Role},
+    ollama::{self, ChatOptions, KeepAlive, Message, ModelOptions, Role, is_model_contained},
 };
 
 mod cli;
@@ -42,6 +44,7 @@ fn main() -> Result<()> {
         bail!("no staged changes");
     }
 
+    eprintln!("git-scribe: preparing prompt...");
     let prompt = Prompt::new(
         &repo,
         &args.context,
@@ -65,8 +68,38 @@ fn main() -> Result<()> {
     }
 
     let client = ollama::Client::default();
+    let chat_options = ChatOptions {
+        options: Some(ModelOptions {
+            temperature: Some(args.temperature),
+            num_ctx: Some(args.model_context),
+            num_predict: if args.think.is_on() {
+                None
+            } else {
+                Some(NUM_PREDICT)
+            },
+            seed: args.seed,
+        }),
+        think: Some(args.think),
+        format: Some(CommitMessage::schema()),
+        keep_alive: args.keep_alive.map(KeepAlive::from),
+        timeout: Some(args.timeout),
+    };
 
-    let response = client.chat(
+    {
+        let loaded = client.list_running_models()?;
+        if is_model_contained(&args.model, args.model_context, &loaded) {
+            eprintln!(
+                "git-scribe: loading {} with a {}-token context...",
+                args.model, args.model_context
+            );
+            client.prepare_model(&args.model, &chat_options)?;
+        }
+    }
+    eprintln!("git-scribe: model ready; processing prompt...");
+
+    let mut thinking_reported = false;
+    let mut generating_reported = false;
+    let response = client.chat_stream(
         &args.model,
         vec![
             Message {
@@ -78,32 +111,43 @@ fn main() -> Result<()> {
                 content: prompt.text,
             },
         ],
-        &ChatOptions {
-            options: Some(ModelOptions {
-                temperature: Some(args.temperature),
-                num_ctx: Some(args.model_context),
-                num_predict: if args.think.is_on() {
-                    None
+        &chat_options,
+        |event| match event {
+            ollama::ChatEvent::Thinking(_) => {
+                if thinking_reported {
+                    // eprint!(".");
+                    // std::io::stderr().flush().ok();
                 } else {
-                    Some(NUM_PREDICT)
-                },
-                seed: args.seed,
-            }),
-            think: Some(args.think),
-            format: Some(CommitMessage::schema()),
-            keep_alive: args.keep_alive.map(KeepAlive::from),
-            timeout: Some(args.timeout),
+                    thinking_reported = true;
+                    eprint!("git-scribe: model thinking...");
+                    std::io::stderr().flush().ok();
+                }
+            }
+            ollama::ChatEvent::Generating(_) => {
+                if generating_reported {
+                    // eprint!(".");
+                    // std::io::stderr().flush().ok();
+                } else {
+                    generating_reported = true;
+                    if thinking_reported {
+                        eprintln!();
+                    }
+                    eprint!("git-scribe: generating commit message...");
+                    std::io::stderr().flush().ok();
+                }
+            }
         },
     )?;
+    eprintln!();
 
     if let Some(actual) = response.prompt_eval_count {
-        eprintln!("git-scribe: Ollama actually used {actual} prompt tokens");
+        eprintln!("git-scribe: actually used {actual} prompt tokens");
     }
 
     eprintln!(
-        "git-scribe: Ollama generated {} tokens, done reason: {:?}",
+        "git-scribe: generated {} tokens, done reason: {}",
         response.eval_count.unwrap_or(0),
-        response.done_reason,
+        response.done_reason.as_deref().unwrap_or("./."),
     );
 
     if let Some(thinking) = response.message.thinking.as_deref()

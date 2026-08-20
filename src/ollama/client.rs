@@ -1,5 +1,8 @@
 use anyhow::Result;
-use reqwest::{StatusCode, blocking::RequestBuilder};
+use reqwest::{
+    StatusCode,
+    blocking::{RequestBuilder, Response},
+};
 use serde::{Deserialize, de::DeserializeOwned};
 use thiserror::Error;
 
@@ -26,6 +29,9 @@ pub enum OllamaError {
     #[error("failed to communicate with Ollama: {0}")]
     Request(#[from] reqwest::Error),
 
+    #[error("failed to read Ollama's streamed response: {0}")]
+    Stream(#[from] std::io::Error),
+
     #[error("Ollama returned HTTP {status}: {message}")]
     Api { status: StatusCode, message: String },
 
@@ -37,6 +43,9 @@ pub enum OllamaError {
 
     #[error("failed to decode Ollama response: {0}")]
     Decode(#[from] serde_json::Error),
+
+    #[error("Ollama ended a streamed response before reporting completion")]
+    IncompleteStream,
 }
 
 #[derive(Debug, Deserialize)]
@@ -59,11 +68,21 @@ impl Client {
     where
         T: DeserializeOwned,
     {
-        let response = request.send()?;
-        let status = response.status();
+        let response = Self::send(request)?;
         let body = response.bytes()?;
 
+        Ok(serde_json::from_slice(&body)?)
+    }
+
+    /// Send a request and return a successful response body without consuming it.
+    ///
+    /// Streaming endpoints use this to check API errors before incrementally reading the body.
+    pub(super) fn send(request: RequestBuilder) -> Result<Response, OllamaError> {
+        let response = request.send()?;
+        let status = response.status();
+
         if !status.is_success() {
+            let body = response.bytes()?;
             let message = serde_json::from_slice::<ErrorResponse>(&body).map_or_else(
                 |_| String::from_utf8_lossy(&body).into_owned(),
                 |response| response.error,
@@ -72,7 +91,7 @@ impl Client {
             return Err(OllamaError::Api { status, message });
         }
 
-        Ok(serde_json::from_slice(&body)?)
+        Ok(response)
     }
 
     pub(super) fn resolve_model_not_found(
@@ -101,6 +120,6 @@ impl Client {
     }
 }
 
-fn normalize_model_name(model: &str) -> &str {
+pub(super) fn normalize_model_name(model: &str) -> &str {
     model.strip_suffix(":latest").unwrap_or(model)
 }
