@@ -1,8 +1,6 @@
 #![warn(clippy::pedantic)]
 #![allow(clippy::missing_errors_doc)]
 
-use std::time::Duration;
-
 use anyhow::{Context as _, Result, bail};
 use clap::Parser as _;
 use git_synopsis::{
@@ -44,7 +42,13 @@ fn main() -> Result<()> {
         bail!("no staged changes");
     }
 
-    let prompt = Prompt::new(&repo, &args.context, &commit, prompt_token_budget)?;
+    let prompt = Prompt::new(
+        &repo,
+        &args.context,
+        &commit,
+        &args.exclude_diff,
+        prompt_token_budget,
+    )?;
 
     eprintln!(
         "git-synopsis: {} file(s) in commit, ~{}/{} (~{:.0}%) prompt tokens used, {}",
@@ -88,7 +92,7 @@ fn main() -> Result<()> {
             think: Some(args.think),
             format: Some(CommitMessage::schema()),
             keep_alive: args.keep_alive.map(KeepAlive::from),
-            timeout: Some(Duration::from_mins(if args.think.is_on() { 5 } else { 3 })),
+            timeout: Some(args.timeout),
         },
     )?;
 

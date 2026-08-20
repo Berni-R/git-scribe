@@ -22,6 +22,12 @@ pub struct Cli {
     #[arg(long, value_name = "TEXT")]
     pub context: Vec<String>,
 
+    /// Exclude a repository-relative file from the concrete and syntax diffs in the prompt.
+    ///
+    /// The file's added, modified, or deleted status remains available to the model.
+    #[arg(long = "exclude-diff", value_name = "PATH")]
+    pub exclude_diff: Vec<PathBuf>,
+
     /// Ollama model to use (e.g. "gemma4:e2b" or "qwen3:4b-instruct").
     ///
     /// Note:
@@ -61,6 +67,10 @@ pub struct Cli {
     /// If not specified, use the Ollama default.
     #[arg(short, long, value_parser = humantime::parse_duration)]
     pub keep_alive: Option<Duration>,
+
+    /// Maximum time to wait for Ollama to respond.
+    #[arg(long, value_parser = humantime::parse_duration, default_value = "2m")]
+    pub timeout: Duration,
 
     /// Print the model's structured analysis to stderr.
     #[arg(long)]
@@ -104,5 +114,32 @@ mod tests {
 
         assert!(cli.print);
         assert!(!cli.amend);
+    }
+
+    #[test]
+    fn diff_exclusions_and_timeout_are_parsed() {
+        let cli = Cli::try_parse_from([
+            "git-synopsis",
+            "--exclude-diff",
+            "generated.css",
+            "--exclude-diff",
+            "daisyui.mjs",
+            "--timeout",
+            "30s",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            cli.exclude_diff,
+            [PathBuf::from("generated.css"), PathBuf::from("daisyui.mjs")]
+        );
+        assert_eq!(cli.timeout, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn timeout_defaults_to_two_minutes() {
+        let cli = Cli::try_parse_from(["git-synopsis"]).unwrap();
+
+        assert_eq!(cli.timeout, Duration::from_mins(2));
     }
 }

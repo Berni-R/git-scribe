@@ -331,7 +331,7 @@ fn working_tree_context_includes_only_non_ignored_files() -> Result<()> {
     );
 
     let commit = repo.prospective_commit(CommitMode::Normal)?;
-    let prompt = crate::generation::Prompt::new(&repo, &[], &commit, 10_000)?;
+    let prompt = crate::generation::Prompt::new(&repo, &[], &commit, &[], 10_000)?;
     assert!(prompt.text.contains("## Working-tree layout"));
     assert!(prompt.text.contains("nested/\n  untracked.rs"));
     assert!(!prompt.text.contains("secret.txt"));
@@ -598,12 +598,39 @@ fn syntax_context_consumes_owned_change_data() -> Result<()> {
     assert_eq!(after.entries.len(), 1);
     assert_eq!(after.entries[0].items[0].declaration, "fn changed()");
 
-    let prompt = crate::generation::Prompt::new(&repo, &[], &commit, 10_000)?;
+    let prompt = crate::generation::Prompt::new(&repo, &[], &commit, &[], 10_000)?;
     assert!(prompt.text.contains("## Syntax context"));
     assert!(prompt.text.contains("### source.rs"));
     assert!(prompt.text.contains("CONTEXT:\nfn changed()"));
     assert!(!prompt.text.contains("BEFORE:\nfn changed()"));
     assert!(!prompt.text.contains("AFTER:\nfn changed()"));
+    Ok(())
+}
+
+#[test]
+fn excluded_diff_file_keeps_status_but_omits_patch_and_syntax_context() -> Result<()> {
+    let fixture = Fixture::new()?;
+    fixture.write_and_stage("kept.rs", "fn kept() { old(); }\n")?;
+    fixture.write_and_stage("generated.rs", "fn generated() { old(); }\n")?;
+    fixture.commit("initial")?;
+    fixture.write_and_stage("kept.rs", "fn kept() { new(); }\n")?;
+    fixture.write_and_stage("generated.rs", "fn generated() { secret(); }\n")?;
+    let repo = fixture.git_repo()?;
+    let commit = repo.prospective_commit(CommitMode::Normal)?;
+
+    let prompt = crate::generation::Prompt::new(
+        &repo,
+        &[],
+        &commit,
+        &[PathBuf::from("generated.rs")],
+        10_000,
+    )?;
+
+    assert!(prompt.text.contains("M\tgenerated.rs"));
+    assert!(prompt.text.contains("fn kept() { new(); }"));
+    assert!(prompt.text.contains("### kept.rs"));
+    assert!(!prompt.text.contains("secret();"));
+    assert!(!prompt.text.contains("### generated.rs"));
     Ok(())
 }
 
@@ -665,7 +692,7 @@ fn rename_with_edit_uses_both_paths_and_blobs_for_syntax() -> Result<()> {
     assert_eq!(after.path, Path::new("new.rs"));
     assert_eq!(before.entries[0].items[0].declaration, "fn process()");
     assert_eq!(after.entries[0].items[0].declaration, "fn process()");
-    let prompt = crate::generation::Prompt::new(&repo, &[], &commit, 10_000)?;
+    let prompt = crate::generation::Prompt::new(&repo, &[], &commit, &[], 10_000)?;
     assert!(prompt.text.contains("### old.rs -> new.rs"));
     Ok(())
 }
@@ -691,7 +718,7 @@ fn syntax_context_preserves_different_before_and_after_structure() -> Result<()>
         after.entries[0].items[0].declaration,
         "#[test]\nfn changed_test()"
     );
-    let prompt = crate::generation::Prompt::new(&repo, &[], &commit, 10_000)?;
+    let prompt = crate::generation::Prompt::new(&repo, &[], &commit, &[], 10_000)?;
     assert!(prompt.text.contains("BEFORE:\nfn production()"));
     assert!(prompt.text.contains("AFTER:\n#[test]\nfn changed_test()"));
     Ok(())
@@ -707,7 +734,7 @@ fn unsupported_file_has_no_syntax_context_or_prompt_section() -> Result<()> {
     let commit = repo.prospective_commit(CommitMode::Normal)?;
 
     assert!(crate::syntax::context_for_change(&repo, only_change(&commit))?.is_none());
-    let prompt = crate::generation::Prompt::new(&repo, &[], &commit, 10_000)?;
+    let prompt = crate::generation::Prompt::new(&repo, &[], &commit, &[], 10_000)?;
     assert!(!prompt.text.contains("## Syntax context"));
     Ok(())
 }

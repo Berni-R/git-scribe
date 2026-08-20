@@ -28,8 +28,10 @@ git synopsis
 ```
 
 Review or revise the generated message in your configured Git editor, then save and close it to
-create the commit. Pass `--amend` to generate and edit a message for the complete amended commit.
+create the commit.
+Pass `--amend` to generate and edit a message for the complete amended commit.
 Use `--print` to print the suggestion without opening the editor or creating a commit.
+Checkout `--help` for more options.
 
 Git automatically maps the `git synopsis` command to an executable named `git-synopsis` on your `PATH`.
 
