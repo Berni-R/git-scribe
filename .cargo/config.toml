@@ -1,0 +1,14 @@
+# only availbale with Rust nightly – expect a ~33% increase in compile time with:
+
+# [build]
+# rustflags = ["-Z", "threads=8"]
+
+
+# only availbale with Rust nightly and not yet stable
+# expect a ~50% increase in compile time with:
+
+# [unstable]
+# codegen-backend = true
+
+# [profile.dev]
+# codegen-backend = "cranelift"
