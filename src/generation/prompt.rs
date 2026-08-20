@@ -2,6 +2,7 @@ use std::{
     ffi::{OsStr, OsString},
     fmt::Write as _,
     fs,
+    io::Write as _,
     path::{Path, PathBuf},
 };
 
@@ -197,7 +198,12 @@ that is fully supported.
             self.text,
         );
 
-        fs::write(path, contents)
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .with_context(|| format!("failed to write model context to {}", path.display()))?;
+        file.write_all(contents.as_bytes())
             .with_context(|| format!("failed to write model context to {}", path.display()))
     }
 

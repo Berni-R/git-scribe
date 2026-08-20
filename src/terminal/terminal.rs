@@ -16,6 +16,8 @@ pub enum TextStyle {
     Green,
     /// Use dim red text.
     Red,
+    /// Use dim slate-blue text for model reasoning.
+    Thinking,
     /// Use orange text.
     Orange,
     /// Use red error text.
@@ -64,6 +66,7 @@ impl Terminal {
     const BOLD_NEUTRAL: &str = "\x1b[1;2;39m";
     const GREEN: &str = "\x1b[2;32m";
     const RED: &str = "\x1b[2;31m";
+    const THINKING: &str = "\x1b[2;38;5;103m";
     const ORANGE: &str = "\x1b[38;5;208m";
     const ERROR: &str = "\x1b[31m";
 
@@ -109,10 +112,90 @@ impl Terminal {
         self.write_line(false, false, [Segment::text(TextStyle::Orange, message)]);
     }
 
+    /// Redraw a spinner above the latest streamed reasoning lines.
+    ///
+    /// Returns the number of visible reasoning lines to pass to the next call.
+    #[must_use]
+    pub fn thinking<'a>(
+        self,
+        first: bool,
+        previous_lines: usize,
+        spinner: impl IntoIterator<Item = Segment<'a>>,
+        lines: &[String],
+    ) -> usize {
+        if !self.progress {
+            return 0;
+        }
+
+        if !self.interactive {
+            if first {
+                self.write_line(false, false, spinner);
+            }
+            return 0;
+        }
+
+        let mut stderr = io::stderr().lock();
+        if !first {
+            let _ = write!(stderr, "\x1b[{}A", previous_lines.saturating_add(1));
+        }
+        let _ = write!(stderr, "\r\x1b[K");
+        self.write_rendered_line(&mut stderr, spinner);
+        self.write_thinking_lines(&mut stderr, previous_lines, lines);
+        let _ = stderr.flush();
+        lines.len()
+    }
+
+    /// Remove a thinking spinner, preserve its latest reasoning lines, and append a completion.
+    pub fn finish_thinking<'a>(
+        self,
+        previous_lines: usize,
+        lines: &[String],
+        completion: impl IntoIterator<Item = Segment<'a>>,
+    ) {
+        if !self.progress {
+            return;
+        }
+
+        if !self.interactive {
+            self.complete(completion);
+            return;
+        }
+
+        let mut stderr = io::stderr().lock();
+        let _ = write!(stderr, "\x1b[{}A", previous_lines.saturating_add(1));
+        self.write_thinking_lines(&mut stderr, previous_lines.saturating_add(1), lines);
+        self.write_rendered_line(&mut stderr, completion);
+        let _ = stderr.flush();
+    }
+
+    fn write_thinking_lines<W: io::Write>(
+        self,
+        output: &mut W,
+        previous_lines: usize,
+        lines: &[String],
+    ) {
+        let rows = previous_lines.max(lines.len());
+        for line_index in 0..rows {
+            let _ = write!(output, "\r\x1b[K");
+            if let Some(line) = lines.get(line_index) {
+                self.write_timestamp(output);
+                self.apply_style(output, TextStyle::Thinking);
+                let _ = write!(output, "{line}");
+                self.reset_style(output);
+            }
+            let _ = writeln!(output);
+        }
+
+        let stale_lines = rows.saturating_sub(lines.len());
+        if stale_lines > 0 {
+            let _ = write!(output, "\x1b[{stale_lines}A");
+        }
+    }
+
     /// Redraw a dim spinner line. A [`Segment::Spinner`] may appear anywhere in `segments`.
     pub fn spinner<'a>(self, first: bool, segments: impl IntoIterator<Item = Segment<'a>>) {
         if self.progress && self.should_write_spinner(first) {
-            self.write_line(self.interactive, first, segments);
+            self.write_line(self.interactive && !first, false, segments);
         }
     }
 
@@ -161,10 +244,18 @@ impl Terminal {
         if replace_previous {
             let _ = write!(stderr, "\x1b[A\r\x1b[K");
         }
-        self.write_timestamp(&mut stderr);
-        self.write_segments(&mut stderr, segments);
-        let _ = writeln!(stderr);
+        self.write_rendered_line(&mut stderr, segments);
         let _ = stderr.flush();
+    }
+
+    fn write_rendered_line<'a, W: io::Write>(
+        self,
+        output: &mut W,
+        segments: impl IntoIterator<Item = Segment<'a>>,
+    ) {
+        self.write_timestamp(output);
+        self.write_segments(output, segments);
+        let _ = writeln!(output);
     }
 
     fn write_segments<'a, W: io::Write>(
@@ -210,6 +301,7 @@ impl Terminal {
             TextStyle::BoldNeutral => Self::BOLD_NEUTRAL,
             TextStyle::Green => Self::GREEN,
             TextStyle::Red => Self::RED,
+            TextStyle::Thinking => Self::THINKING,
             TextStyle::Orange => Self::ORANGE,
             TextStyle::Error => Self::ERROR,
         }

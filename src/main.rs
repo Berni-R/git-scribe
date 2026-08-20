@@ -1,7 +1,12 @@
 #![warn(clippy::pedantic)]
 #![allow(clippy::missing_errors_doc)]
 
-use std::time::{Duration, Instant};
+use std::{
+    env, fs,
+    io::ErrorKind,
+    path::Path,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context as _, Result, bail};
 use clap::Parser as _;
@@ -26,6 +31,9 @@ const NUM_PREDICT: i32 = 384;
 /// Minimum context reserved for model reasoning and the final response when generation itself is not capped.
 const THINKING_CONTEXT_RESERVE: u32 = 4_096;
 
+const THINKING_PREVIEW_LINES: usize = 5;
+const THINKING_PREVIEW_FALLBACK_COLUMNS: usize = 72;
+
 #[allow(clippy::too_many_lines)]
 #[allow(clippy::cast_precision_loss)]
 fn main() {
@@ -42,6 +50,7 @@ fn main() {
 #[allow(clippy::cast_precision_loss)]
 fn run(args: &cli::Cli, terminal: Terminal) -> Result<()> {
     args.validate()?;
+    ensure_output_paths_are_available(args)?;
     let mode = args.commit_mode();
 
     let predict_reserve = if args.think.is_on() {
@@ -130,6 +139,8 @@ fn run(args: &cli::Cli, terminal: Terminal) -> Result<()> {
     let prompt_sent_at = Instant::now();
     let mut thinking_started_at = None;
     let mut generating_started_at = None;
+    let mut thinking_preview = ThinkingPreview::new(thinking_preview_columns());
+    let mut rendered_thinking_lines = 0;
     terminal.status_segments([
         Segment::text(TextStyle::Neutral, format_args!("Sending prompt to ")),
         Segment::text(TextStyle::BoldNeutral, format_args!("{}", args.model)),
@@ -156,33 +167,62 @@ fn run(args: &cli::Cli, terminal: Terminal) -> Result<()> {
                     format_args!("Ollama responded in {}", format_elapsed(response_time)),
                 )]);
             }
-            ChatEvent::Thinking(_) => {
+            ChatEvent::Thinking(thinking) => {
                 let first = thinking_started_at.is_none();
                 let thinking_elapsed = thinking_started_at
                     .get_or_insert_with(Instant::now)
                     .elapsed();
-                terminal.spinner(
-                    first,
-                    [
-                        Segment::spinner(TextStyle::Neutral, spinner.next_frame()),
-                        Segment::text(
-                            TextStyle::Neutral,
-                            format_args!(" Thinking ({})", format_elapsed(thinking_elapsed)),
-                        ),
-                    ],
-                );
+                if args.show_thinking {
+                    rendered_thinking_lines = terminal.thinking(
+                        first,
+                        rendered_thinking_lines,
+                        [
+                            Segment::spinner(TextStyle::Neutral, spinner.next_frame()),
+                            Segment::text(
+                                TextStyle::Neutral,
+                                format_args!(" Thinking ({})", format_elapsed(thinking_elapsed)),
+                            ),
+                        ],
+                        &thinking_preview.push(&thinking),
+                    );
+                } else {
+                    terminal.spinner(
+                        first,
+                        [
+                            Segment::spinner(TextStyle::Neutral, spinner.next_frame()),
+                            Segment::text(
+                                TextStyle::Neutral,
+                                format_args!(" Thinking ({})", format_elapsed(thinking_elapsed)),
+                            ),
+                        ],
+                    );
+                }
             }
             ChatEvent::Generating(_) => {
                 if generating_started_at.is_none()
                     && let Some(thinking_started_at) = thinking_started_at
                 {
-                    terminal.complete([Segment::text(
-                        TextStyle::Neutral,
-                        format_args!(
-                            "Thinking done in {}",
-                            format_elapsed(thinking_started_at.elapsed()),
-                        ),
-                    )]);
+                    if args.show_thinking {
+                        terminal.finish_thinking(
+                            rendered_thinking_lines,
+                            &thinking_preview.finish(),
+                            [Segment::text(
+                                TextStyle::Neutral,
+                                format_args!(
+                                    "Thought for {}",
+                                    format_elapsed(thinking_started_at.elapsed()),
+                                ),
+                            )],
+                        );
+                    } else {
+                        terminal.complete([Segment::text(
+                            TextStyle::Neutral,
+                            format_args!(
+                                "Thought for {}",
+                                format_elapsed(thinking_started_at.elapsed()),
+                            ),
+                        )]);
+                    }
                 }
                 let first = generating_started_at.is_none();
                 let generating_elapsed = generating_started_at
@@ -214,13 +254,36 @@ fn run(args: &cli::Cli, terminal: Terminal) -> Result<()> {
             ),
         )]);
     } else if let Some(thinking_started_at) = thinking_started_at {
-        terminal.complete([Segment::text(
-            TextStyle::Neutral,
-            format_args!(
-                "Thinking done in {}",
-                format_elapsed(thinking_started_at.elapsed()),
-            ),
-        )]);
+        if args.show_thinking {
+            terminal.finish_thinking(
+                rendered_thinking_lines,
+                &thinking_preview.finish(),
+                [Segment::text(
+                    TextStyle::Neutral,
+                    format_args!(
+                        "Thinking done in {}",
+                        format_elapsed(thinking_started_at.elapsed()),
+                    ),
+                )],
+            );
+        } else {
+            terminal.complete([Segment::text(
+                TextStyle::Neutral,
+                format_args!(
+                    "Thinking done in {}",
+                    format_elapsed(thinking_started_at.elapsed()),
+                ),
+            )]);
+        }
+    }
+
+    if let Some(path) = &args.stream_file {
+        write_stream_file(
+            path,
+            response.message.thinking.as_deref(),
+            &response.message.content,
+        )?;
+        terminal.status(format_args!("Wrote model streams to: {}", path.display()));
     }
 
     match response.done_reason.as_deref() {
@@ -303,6 +366,122 @@ fn format_elapsed(duration: Duration) -> String {
     }
 }
 
+struct ThinkingPreview {
+    column_limit: usize,
+    completed_lines: Vec<String>,
+    current_line: String,
+}
+
+impl ThinkingPreview {
+    const fn new(column_limit: usize) -> Self {
+        Self {
+            column_limit,
+            completed_lines: Vec::new(),
+            current_line: String::new(),
+        }
+    }
+
+    fn push(&mut self, fragment: &str) -> Vec<String> {
+        for character in fragment.chars() {
+            match character {
+                '\r' => {}
+                '\n' => self.complete_current_line(),
+                _ => {
+                    self.current_line.push(character);
+                    if self.current_line.chars().count() == self.column_limit {
+                        self.complete_current_line();
+                    }
+                }
+            }
+        }
+        self.visible_lines()
+    }
+
+    fn finish(&mut self) -> Vec<String> {
+        if !self.current_line.is_empty() {
+            self.complete_current_line();
+        }
+        self.visible_lines()
+    }
+
+    fn complete_current_line(&mut self) {
+        self.completed_lines
+            .push(std::mem::take(&mut self.current_line));
+        if self.completed_lines.len() > THINKING_PREVIEW_LINES {
+            self.completed_lines.remove(0);
+        }
+    }
+
+    fn visible_lines(&self) -> Vec<String> {
+        let mut lines = self.completed_lines.clone();
+        if !self.current_line.is_empty() {
+            lines.push(self.current_line.clone());
+        }
+        let first = lines.len().saturating_sub(THINKING_PREVIEW_LINES);
+        lines.drain(..first);
+        lines
+    }
+}
+
+fn thinking_preview_columns() -> usize {
+    const TIMESTAMP_COLUMNS: usize = 11; // `[HH:MM:SS] `
+    const MINIMUM_COLUMNS: usize = 20;
+
+    env::var("COLUMNS")
+        .ok()
+        .and_then(|columns| columns.parse::<usize>().ok())
+        .filter(|&columns| columns >= MINIMUM_COLUMNS)
+        .map_or(THINKING_PREVIEW_FALLBACK_COLUMNS, |columns| {
+            columns.saturating_sub(TIMESTAMP_COLUMNS).max(1)
+        })
+}
+
+fn write_stream_file(path: &std::path::Path, thinking: Option<&str>, content: &str) -> Result<()> {
+    let contents = format!(
+        "# Thinking\n{}\n\n# Generation\n{content}",
+        thinking.unwrap_or_default(),
+    );
+    write_new_file(path, &contents)
+        .with_context(|| format!("failed to write model streams to {}", path.display()))
+}
+
+fn ensure_output_paths_are_available(args: &cli::Cli) -> Result<()> {
+    if let (Some(context_file), Some(stream_file)) = (&args.context_file, &args.stream_file)
+        && context_file == stream_file
+    {
+        bail!(
+            "--context-file and --stream-file must name different files ({})",
+            context_file.display(),
+        );
+    }
+
+    for path in [args.context_file.as_deref(), args.stream_file.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        match fs::symlink_metadata(path) {
+            Ok(_) => bail!("refusing to overwrite existing file: {}", path.display()),
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to inspect output path {}", path.display()));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn write_new_file(path: &Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    file.write_all(contents.as_bytes())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -312,5 +491,26 @@ mod tests {
         assert_eq!(format_elapsed(Duration::from_millis(499)), "0s");
         assert_eq!(format_elapsed(Duration::from_millis(500)), "1s");
         assert_eq!(format_elapsed(Duration::from_secs(70)), "1m 10s");
+    }
+
+    #[test]
+    fn thinking_preview_keeps_the_latest_five_lines_across_fragments() {
+        let mut preview = ThinkingPreview::new(80);
+        preview.push("one\ntwo\n");
+        let lines = preview.push("three\nfour\nfive\nsix");
+
+        assert_eq!(lines, ["two", "three", "four", "five", "six"]);
+    }
+
+    #[test]
+    fn existing_output_file_is_rejected_before_generation() {
+        let args = cli::Cli::try_parse_from(["git-scribe", "--stream-file", "Cargo.toml"]).unwrap();
+
+        assert!(
+            ensure_output_paths_are_available(&args)
+                .unwrap_err()
+                .to_string()
+                .contains("refusing to overwrite")
+        );
     }
 }

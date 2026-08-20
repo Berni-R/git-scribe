@@ -1,5 +1,6 @@
-# typical context output
-context.md
+# typical context or generation output
+*.md
+*.txt
 
 # compiled / distribute directories
 build/

@@ -69,6 +69,14 @@ pub struct Cli {
     #[arg(long, value_enum, default_value_t = Think::Off)]
     pub think: Think,
 
+    /// Show the latest five lines of the streamed model reasoning trace.
+    #[arg(long)]
+    pub show_thinking: bool,
+
+    /// Write the complete thinking trace and generated response to this file.
+    #[arg(long, value_name = "FILE")]
+    pub stream_file: Option<PathBuf>,
+
     /// Keep the Ollama model alive after execution.
     ///
     /// A value of `0` unloads the model immediately.
@@ -167,5 +175,19 @@ mod tests {
         assert!(short.quiet);
         assert!(long.quiet);
         assert!(conventional.quiet);
+    }
+
+    #[test]
+    fn thinking_display_and_stream_file_are_parsed() {
+        let cli = Cli::try_parse_from([
+            "git-scribe",
+            "--show-thinking",
+            "--stream-file",
+            "response.txt",
+        ])
+        .unwrap();
+
+        assert!(cli.show_thinking);
+        assert_eq!(cli.stream_file, Some(PathBuf::from("response.txt")));
     }
 }
