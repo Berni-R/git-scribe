@@ -30,7 +30,7 @@ const THINKING_CONTEXT_RESERVE: u32 = 4_096;
 #[allow(clippy::cast_precision_loss)]
 fn main() {
     let args = cli::Cli::parse();
-    let terminal = Terminal::new(!args.no_color, true);
+    let terminal = Terminal::new(!args.no_color, true).with_progress(!args.quiet);
 
     if let Err(error) = run(&args, terminal) {
         terminal.error(&error);
@@ -78,9 +78,10 @@ fn run(args: &cli::Cli, terminal: Terminal) -> Result<()> {
         Segment::text(TextStyle::Red, format_args!("-{}", stats.deletions)),
     ]);
     let token_bar = Terminal::progress_bar(prompt.estimated_tokens, prompt_token_budget, 25);
+    let prompt_token_percentage = prompt.estimated_tokens.saturating_mul(100) / prompt_token_budget;
     terminal.status(format_args!(
-        "Estimated prompt tokens: {token_bar} {}/{}",
-        prompt.estimated_tokens, prompt_token_budget,
+        "Estimated input budget: {token_bar} {} / {} tokens ({}%)",
+        prompt.estimated_tokens, prompt_token_budget, prompt_token_percentage,
     ));
 
     if let Some(path) = &args.context_file {
@@ -133,6 +134,7 @@ fn run(args: &cli::Cli, terminal: Terminal) -> Result<()> {
         Segment::text(TextStyle::Neutral, format_args!("Sending prompt to ")),
         Segment::text(TextStyle::BoldNeutral, format_args!("{}", args.model)),
     ]);
+    terminal.status(format_args!("Waiting for Ollama..."));
     let response = client.chat_stream(
         &args.model,
         vec![
@@ -149,19 +151,24 @@ fn run(args: &cli::Cli, terminal: Terminal) -> Result<()> {
         |event| match event {
             ChatEvent::ResponseStarted => {
                 let response_time = prompt_sent_at.elapsed();
-                terminal.status(format_args!(
-                    "Ollama responded in {}",
-                    format_elapsed(response_time),
-                ));
+                terminal.complete([Segment::text(
+                    TextStyle::Neutral,
+                    format_args!("Ollama responded in {}", format_elapsed(response_time)),
+                )]);
             }
             ChatEvent::Thinking(_) => {
                 let first = thinking_started_at.is_none();
-                thinking_started_at.get_or_insert_with(Instant::now);
+                let thinking_elapsed = thinking_started_at
+                    .get_or_insert_with(Instant::now)
+                    .elapsed();
                 terminal.spinner(
                     first,
                     [
                         Segment::spinner(TextStyle::Neutral, spinner.next_frame()),
-                        Segment::text(TextStyle::Neutral, format_args!(" Thinking")),
+                        Segment::text(
+                            TextStyle::Neutral,
+                            format_args!(" Thinking ({})", format_elapsed(thinking_elapsed)),
+                        ),
                     ],
                 );
             }
@@ -178,22 +185,31 @@ fn run(args: &cli::Cli, terminal: Terminal) -> Result<()> {
                     )]);
                 }
                 let first = generating_started_at.is_none();
-                generating_started_at.get_or_insert_with(Instant::now);
+                let generating_elapsed = generating_started_at
+                    .get_or_insert_with(Instant::now)
+                    .elapsed();
                 terminal.spinner(
                     first,
                     [
                         Segment::spinner(TextStyle::Neutral, spinner.next_frame()),
-                        Segment::text(TextStyle::Neutral, format_args!(" Generating")),
+                        Segment::text(
+                            TextStyle::Neutral,
+                            format_args!(" Generating ({})", format_elapsed(generating_elapsed)),
+                        ),
                     ],
                 );
             }
         },
     )?;
     if let Some(generating_started_at) = generating_started_at {
+        let total_tokens = response
+            .prompt_eval_count
+            .unwrap_or_default()
+            .saturating_add(response.eval_count.unwrap_or_default());
         terminal.complete([Segment::text(
             TextStyle::Neutral,
             format_args!(
-                "Generation done in {}",
+                "Generation done in {} · {total_tokens} total tokens",
                 format_elapsed(generating_started_at.elapsed()),
             ),
         )]);
@@ -206,15 +222,6 @@ fn run(args: &cli::Cli, terminal: Terminal) -> Result<()> {
             ),
         )]);
     }
-
-    // terminal.status(format_args!(
-    //     "Tokens used: {} + {} = {}/{}",
-    //     response.prompt_eval_count.unwrap_or(0),
-    //     response.eval_count.unwrap_or(0),
-    //     // TODO: double-check if that is the total budget
-    //     response.prompt_eval_count.unwrap_or(0) + response.eval_count.unwrap_or(0),
-    //     args.model_context,
-    // ));
 
     match response.done_reason.as_deref() {
         Some("stop") => {}

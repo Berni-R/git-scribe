@@ -1,6 +1,6 @@
 use std::{
     fmt,
-    io::{self, Write as _},
+    io::{self, IsTerminal as _, Write as _},
 };
 
 use time::{OffsetDateTime, format_description::well_known::Iso8601};
@@ -48,8 +48,11 @@ impl<'a> Segment<'a> {
 
 /// Styled terminal output reserved for diagnostics on stderr.
 #[derive(Debug, Clone, Copy)]
+#[allow(clippy::struct_excessive_bools)] // These flags represent independent terminal capabilities.
 pub struct Terminal {
     color: bool,
+    interactive: bool,
+    progress: bool,
     timestamp: bool,
 }
 
@@ -66,33 +69,59 @@ impl Terminal {
 
     /// Create terminal output, optionally decorated with ANSI colors and timestamps.
     #[must_use]
-    pub const fn new(color: bool, timestamp: bool) -> Self {
-        Self { color, timestamp }
+    pub fn new(color: bool, timestamp: bool) -> Self {
+        Self {
+            color,
+            interactive: io::stderr().is_terminal(),
+            progress: true,
+            timestamp,
+        }
+    }
+
+    /// Enable or disable diagnostic progress output while retaining error output.
+    #[must_use]
+    pub const fn with_progress(mut self, progress: bool) -> Self {
+        self.progress = progress;
+        self
     }
 
     /// Write a dim diagnostic line to stderr.
     pub fn status(self, message: fmt::Arguments<'_>) {
+        if !self.progress {
+            return;
+        }
         self.status_segments([Segment::text(TextStyle::Neutral, message)]);
     }
 
     /// Write a dim diagnostic line with individually styled fragments.
     pub fn status_segments<'a>(self, segments: impl IntoIterator<Item = Segment<'a>>) {
+        if !self.progress {
+            return;
+        }
         self.write_line(false, false, segments);
     }
 
     /// Write an orange warning line to stderr.
     pub fn warning(self, message: fmt::Arguments<'_>) {
+        if !self.progress {
+            return;
+        }
         self.write_line(false, false, [Segment::text(TextStyle::Orange, message)]);
     }
 
     /// Redraw a dim spinner line. A [`Segment::Spinner`] may appear anywhere in `segments`.
     pub fn spinner<'a>(self, first: bool, segments: impl IntoIterator<Item = Segment<'a>>) {
-        self.write_line(true, first, segments);
+        if self.progress && self.should_write_spinner(first) {
+            self.write_line(self.interactive, first, segments);
+        }
     }
 
     /// Replace an active spinner with a styled completion line.
     pub fn complete<'a>(self, segments: impl IntoIterator<Item = Segment<'a>>) {
-        self.write_line(true, false, segments);
+        if !self.progress {
+            return;
+        }
+        self.write_line(self.interactive, false, segments);
     }
 
     /// Write an error and its context chain in red to stderr.
@@ -157,6 +186,10 @@ impl Terminal {
                 }
             }
         }
+    }
+
+    const fn should_write_spinner(self, first: bool) -> bool {
+        self.interactive || first
     }
 
     fn apply_style<W: io::Write>(self, output: &mut W, style: TextStyle) {
@@ -224,5 +257,18 @@ mod tests {
                 "\x1b[0m\x1b[2;31m-1\x1b[0m",
             )
         );
+    }
+
+    #[test]
+    fn non_interactive_output_writes_each_spinner_phase_once() {
+        let terminal = Terminal {
+            color: false,
+            interactive: false,
+            progress: true,
+            timestamp: false,
+        };
+
+        assert!(terminal.should_write_spinner(true));
+        assert!(!terminal.should_write_spinner(false));
     }
 }

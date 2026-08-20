@@ -49,6 +49,10 @@ pub struct Cli {
     #[arg(long)]
     pub no_color: bool,
 
+    /// Suppress progress output and print only the generated message.
+    #[arg(short = 'q', long = "quite", alias = "quiet")]
+    pub quiet: bool,
+
     /// Model context window, in tokens.
     #[arg(short = 'c', long, default_value_t = 16_384)]
     pub model_context: u32,
@@ -152,5 +156,16 @@ mod tests {
         let cli = Cli::try_parse_from(["git-scribe", "--no-color"]).unwrap();
 
         assert!(cli.no_color);
+    }
+
+    #[test]
+    fn quiet_flag_suppresses_progress_output() {
+        let short = Cli::try_parse_from(["git-scribe", "-q"]).unwrap();
+        let long = Cli::try_parse_from(["git-scribe", "--quite"]).unwrap();
+        let conventional = Cli::try_parse_from(["git-scribe", "--quiet"]).unwrap();
+
+        assert!(short.quiet);
+        assert!(long.quiet);
+        assert!(conventional.quiet);
     }
 }
