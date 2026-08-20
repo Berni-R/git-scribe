@@ -1,7 +1,7 @@
 use std::{path::PathBuf, time::Duration};
 
 use clap::Parser;
-use git_synopsis::{git::CommitMode, ollama::Think};
+use git_scribe::{git::CommitMode, ollama::Think};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -110,7 +110,7 @@ mod tests {
 
     #[test]
     fn print_flag_selects_print_only_mode() {
-        let cli = Cli::try_parse_from(["git-synopsis", "--print"]).unwrap();
+        let cli = Cli::try_parse_from(["git-scribe", "--print"]).unwrap();
 
         assert!(cli.print);
         assert!(!cli.amend);
@@ -119,7 +119,7 @@ mod tests {
     #[test]
     fn diff_exclusions_and_timeout_are_parsed() {
         let cli = Cli::try_parse_from([
-            "git-synopsis",
+            "git-scribe",
             "--exclude-diff",
             "generated.css",
             "--exclude-diff",
@@ -138,7 +138,7 @@ mod tests {
 
     #[test]
     fn timeout_defaults_to_two_minutes() {
-        let cli = Cli::try_parse_from(["git-synopsis"]).unwrap();
+        let cli = Cli::try_parse_from(["git-scribe"]).unwrap();
 
         assert_eq!(cli.timeout, Duration::from_mins(2));
     }

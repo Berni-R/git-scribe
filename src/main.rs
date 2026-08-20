@@ -3,7 +3,7 @@
 
 use anyhow::{Context as _, Result, bail};
 use clap::Parser as _;
-use git_synopsis::{
+use git_scribe::{
     GitRepo,
     generation::{CommitMessage, Confidence, Prompt},
     ollama::{self, ChatOptions, KeepAlive, Message, ModelOptions, Role},
@@ -51,7 +51,7 @@ fn main() -> Result<()> {
     )?;
 
     eprintln!(
-        "git-synopsis: {} file(s) in commit, ~{}/{} (~{:.0}%) prompt tokens used, {}",
+        "git-scribe: {} file(s) in commit, ~{}/{} (~{:.0}%) prompt tokens used, {}",
         commit.len(),
         prompt.estimated_tokens,
         prompt_token_budget,
@@ -61,7 +61,7 @@ fn main() -> Result<()> {
 
     if let Some(path) = &args.context_file {
         prompt.write_context(path)?;
-        eprintln!("git-synopsis: wrote model context to {}", path.display());
+        eprintln!("git-scribe: wrote model context to {}", path.display());
     }
 
     let client = ollama::Client::default();
@@ -97,11 +97,11 @@ fn main() -> Result<()> {
     )?;
 
     if let Some(actual) = response.prompt_eval_count {
-        eprintln!("git-synopsis: Ollama actually used {actual} prompt tokens");
+        eprintln!("git-scribe: Ollama actually used {actual} prompt tokens");
     }
 
     eprintln!(
-        "git-synopsis: Ollama generated {} tokens, done reason: {:?}",
+        "git-scribe: Ollama generated {} tokens, done reason: {:?}",
         response.eval_count.unwrap_or(0),
         response.done_reason,
     );
@@ -110,7 +110,7 @@ fn main() -> Result<()> {
         && !thinking.is_empty()
     {
         eprintln!(
-            "git-synopsis: model produced {} bytes of thinking",
+            "git-scribe: model produced {} bytes of thinking",
             thinking.len(),
         );
     }
@@ -138,17 +138,17 @@ fn main() -> Result<()> {
     };
 
     if response.done_reason.as_deref() == Some("length") {
-        eprintln!("git-synopsis: warning: model output hit the token limit");
+        eprintln!("git-scribe: warning: model output hit the token limit");
     }
     if matches!(answer.confidence, Confidence::Low) {
         eprintln!(
-            "git-synopsis: warning: model reports low confidence ({:?}): {}",
+            "git-scribe: warning: model reports low confidence ({:?}): {}",
             answer.change_kind, answer.intent,
         );
     }
 
     if args.show_analysis {
-        eprintln!("git-synopsis: model analysis:");
+        eprintln!("git-scribe: model analysis:");
         eprintln!("  intent: {}", answer.intent);
         eprintln!("  kind: {:?}", answer.change_kind);
         eprintln!("  confidence: {:?}", answer.confidence);
@@ -173,7 +173,7 @@ fn main() -> Result<()> {
     if args.print {
         println!("{commit_message}");
     } else {
-        eprintln!("git-synopsis: opening the Git commit editor");
+        eprintln!("git-scribe: opening the Git commit editor");
         repo.commit_interactively(mode, &commit_message)?;
     }
 

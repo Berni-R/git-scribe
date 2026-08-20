@@ -254,7 +254,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "git-synopsis"
+name = "git-scribe"
 version = "0.2.1"
 dependencies = [
  "anyhow",
