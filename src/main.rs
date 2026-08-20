@@ -1,13 +1,17 @@
 #![warn(clippy::pedantic)]
 #![allow(clippy::missing_errors_doc)]
 
+use std::time::{Duration, Instant};
+
 use anyhow::{Context as _, Result, bail};
 use clap::Parser as _;
 use git_scribe::{
     GitRepo,
     generation::{CommitMessage, Confidence, Prompt},
-    ollama::{self, ChatOptions, KeepAlive, Message, ModelOptions, Role, is_model_contained},
-    terminal,
+    ollama::{
+        self, ChatEvent, ChatOptions, KeepAlive, Message, ModelOptions, Role, is_model_contained,
+    },
+    terminal::{Segment, Spinner, Terminal, TextStyle},
 };
 
 mod cli;
@@ -26,7 +30,7 @@ const THINKING_CONTEXT_RESERVE: u32 = 4_096;
 #[allow(clippy::cast_precision_loss)]
 fn main() {
     let args = cli::Cli::parse();
-    let terminal = terminal::Terminal::new(!args.no_color);
+    let terminal = Terminal::new(!args.no_color, true);
 
     if let Err(error) = run(&args, terminal) {
         terminal.error(&error);
@@ -36,7 +40,7 @@ fn main() {
 
 #[allow(clippy::too_many_lines)]
 #[allow(clippy::cast_precision_loss)]
-fn run(args: &cli::Cli, terminal: terminal::Terminal) -> Result<()> {
+fn run(args: &cli::Cli, terminal: Terminal) -> Result<()> {
     args.validate()?;
     let mode = args.commit_mode();
 
@@ -62,12 +66,21 @@ fn run(args: &cli::Cli, terminal: terminal::Terminal) -> Result<()> {
         prompt_token_budget,
     )?;
 
-    terminal.status(format_args!("{} file(s) in commit", commit.len()));
+    let stats = commit.stats();
+    terminal.status_segments([
+        Segment::text(
+            TextStyle::Neutral,
+            format_args!("{} file(s) in commit; ", stats.files_changed),
+        ),
+        Segment::text(TextStyle::Neutral, format_args!("line changes: ")),
+        Segment::text(TextStyle::Green, format_args!("+{}", stats.insertions)),
+        Segment::text(TextStyle::Neutral, format_args!(" ")),
+        Segment::text(TextStyle::Red, format_args!("-{}", stats.deletions)),
+    ]);
+    let token_bar = Terminal::progress_bar(prompt.estimated_tokens, prompt_token_budget, 25);
     terminal.status(format_args!(
-        "Estimated prompt token usage: {}/{} ({:.0}%)",
-        prompt.estimated_tokens,
-        prompt_token_budget,
-        100.0 * prompt.estimated_tokens as f64 / prompt_token_budget as f64,
+        "Estimated prompt tokens: {token_bar} {}/{}",
+        prompt.estimated_tokens, prompt_token_budget,
     ));
 
     if let Some(path) = &args.context_file {
@@ -96,10 +109,14 @@ fn run(args: &cli::Cli, terminal: terminal::Terminal) -> Result<()> {
     {
         let loaded = client.list_running_models()?;
         if !is_model_contained(&args.model, args.model_context, &loaded) {
-            terminal.status(format_args!(
-                "Loading {} with a {}-token context...",
-                args.model, args.model_context
-            ));
+            terminal.status_segments([
+                Segment::text(TextStyle::Neutral, format_args!("Loading ")),
+                Segment::text(TextStyle::BoldNeutral, format_args!("{}", args.model)),
+                Segment::text(
+                    TextStyle::Neutral,
+                    format_args!(" with a {} token context...", args.model_context),
+                ),
+            ]);
             if let Some(done) = client.prepare_model(&args.model, &chat_options)?
                 && done != "load"
             {
@@ -108,10 +125,14 @@ fn run(args: &cli::Cli, terminal: terminal::Terminal) -> Result<()> {
         }
     }
 
-    let mut spinner = terminal::Spinner::default();
-    let mut thinking_started = false;
-    let mut generating_started = false;
-    terminal.status(format_args!("Sending prompt to {}", args.model));
+    let mut spinner = Spinner::default();
+    let prompt_sent_at = Instant::now();
+    let mut thinking_started_at = None;
+    let mut generating_started_at = None;
+    terminal.status_segments([
+        Segment::text(TextStyle::Neutral, format_args!("Sending prompt to ")),
+        Segment::text(TextStyle::BoldNeutral, format_args!("{}", args.model)),
+    ]);
     let response = client.chat_stream(
         &args.model,
         vec![
@@ -126,31 +147,75 @@ fn run(args: &cli::Cli, terminal: terminal::Terminal) -> Result<()> {
         ],
         &chat_options,
         |event| match event {
-            ollama::ChatEvent::Thinking(_) => {
-                thinking_started = true;
-                terminal.spinner(spinner.next_frame(), format_args!("Thinking"));
+            ChatEvent::ResponseStarted => {
+                let response_time = prompt_sent_at.elapsed();
+                terminal.status(format_args!(
+                    "Ollama responded in {}",
+                    format_elapsed(response_time),
+                ));
             }
-            ollama::ChatEvent::Generating(_) => {
-                if thinking_started && !generating_started {
-                    terminal.complete(format_args!("Done thinking."));
-                }
-                generating_started = true;
+            ChatEvent::Thinking(_) => {
+                let first = thinking_started_at.is_none();
+                thinking_started_at.get_or_insert_with(Instant::now);
                 terminal.spinner(
-                    spinner.next_frame(),
-                    format_args!("Generating commit message"),
+                    first,
+                    [
+                        Segment::spinner(TextStyle::Neutral, spinner.next_frame()),
+                        Segment::text(TextStyle::Neutral, format_args!(" Thinking")),
+                    ],
+                );
+            }
+            ChatEvent::Generating(_) => {
+                if generating_started_at.is_none()
+                    && let Some(thinking_started_at) = thinking_started_at
+                {
+                    terminal.complete([Segment::text(
+                        TextStyle::Neutral,
+                        format_args!(
+                            "Thinking done in {}",
+                            format_elapsed(thinking_started_at.elapsed()),
+                        ),
+                    )]);
+                }
+                let first = generating_started_at.is_none();
+                generating_started_at.get_or_insert_with(Instant::now);
+                terminal.spinner(
+                    first,
+                    [
+                        Segment::spinner(TextStyle::Neutral, spinner.next_frame()),
+                        Segment::text(TextStyle::Neutral, format_args!(" Generating")),
+                    ],
                 );
             }
         },
     )?;
-    if generating_started {
-        terminal.complete(format_args!("Commit message generated."));
+    if let Some(generating_started_at) = generating_started_at {
+        terminal.complete([Segment::text(
+            TextStyle::Neutral,
+            format_args!(
+                "Generation done in {}",
+                format_elapsed(generating_started_at.elapsed()),
+            ),
+        )]);
+    } else if let Some(thinking_started_at) = thinking_started_at {
+        terminal.complete([Segment::text(
+            TextStyle::Neutral,
+            format_args!(
+                "Thinking done in {}",
+                format_elapsed(thinking_started_at.elapsed()),
+            ),
+        )]);
     }
 
-    terminal.status(format_args!(
-        "Tokens used: {} + {}",
-        response.prompt_eval_count.unwrap_or(0),
-        response.eval_count.unwrap_or(0),
-    ));
+    // terminal.status(format_args!(
+    //     "Tokens used: {} + {} = {}/{}",
+    //     response.prompt_eval_count.unwrap_or(0),
+    //     response.eval_count.unwrap_or(0),
+    //     // TODO: double-check if that is the total budget
+    //     response.prompt_eval_count.unwrap_or(0) + response.eval_count.unwrap_or(0),
+    //     args.model_context,
+    // ));
+
     match response.done_reason.as_deref() {
         Some("stop") => {}
         Some("length") => terminal.warning(format_args!("Model output hit the token limit")),
@@ -215,4 +280,30 @@ fn run(args: &cli::Cli, terminal: terminal::Terminal) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn format_elapsed(duration: Duration) -> String {
+    let seconds = duration
+        .as_secs()
+        .saturating_add(u64::from(duration.subsec_millis() >= 500));
+    let minutes = seconds / 60;
+    let seconds = seconds % 60;
+
+    if minutes == 0 {
+        format!("{seconds}s")
+    } else {
+        format!("{minutes}m {seconds}s")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn elapsed_times_round_to_whole_seconds_and_include_minutes() {
+        assert_eq!(format_elapsed(Duration::from_millis(499)), "0s");
+        assert_eq!(format_elapsed(Duration::from_millis(500)), "1s");
+        assert_eq!(format_elapsed(Duration::from_secs(70)), "1m 10s");
+    }
 }

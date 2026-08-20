@@ -132,6 +132,8 @@ pub struct ChatResponse {
 /// A meaningful transition observed while a chat response is being streamed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChatEvent {
+    /// Ollama accepted the request and returned the first streaming response header.
+    ResponseStarted,
     /// A streamed fragment of deliberate reasoning output.
     Thinking(String),
     /// A streamed fragment of visible response content.
@@ -201,7 +203,7 @@ impl Client {
         model: impl Into<String>,
         messages: Vec<Message>,
         options: &ChatOptions,
-        on_event: F,
+        mut on_event: F,
     ) -> Result<ChatResponse, OllamaError>
     where
         F: FnMut(ChatEvent),
@@ -209,6 +211,7 @@ impl Client {
         let request = ChatRequest::new(model, messages, options, true);
         let response = self.send_chat(&request, options.timeout)?;
 
+        on_event(ChatEvent::ResponseStarted);
         collect_stream(BufReader::new(response), on_event)
     }
 
