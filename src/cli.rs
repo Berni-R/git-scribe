@@ -45,6 +45,10 @@ pub struct Cli {
     #[arg(short, long)]
     pub print: bool,
 
+    /// Disable ANSI colors in diagnostic output.
+    #[arg(long)]
+    pub no_color: bool,
+
     /// Model context window, in tokens.
     #[arg(short = 'c', long, default_value_t = 16_384)]
     pub model_context: u32,
@@ -141,5 +145,12 @@ mod tests {
         let cli = Cli::try_parse_from(["git-scribe"]).unwrap();
 
         assert_eq!(cli.timeout, Duration::from_mins(2));
+    }
+
+    #[test]
+    fn no_color_flag_disables_terminal_styling() {
+        let cli = Cli::try_parse_from(["git-scribe", "--no-color"]).unwrap();
+
+        assert!(cli.no_color);
     }
 }

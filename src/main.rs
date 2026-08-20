@@ -1,14 +1,13 @@
 #![warn(clippy::pedantic)]
 #![allow(clippy::missing_errors_doc)]
 
-use std::io::Write as _;
-
 use anyhow::{Context as _, Result, bail};
 use clap::Parser as _;
 use git_scribe::{
     GitRepo,
     generation::{CommitMessage, Confidence, Prompt},
     ollama::{self, ChatOptions, KeepAlive, Message, ModelOptions, Role, is_model_contained},
+    terminal,
 };
 
 mod cli;
@@ -25,8 +24,19 @@ const THINKING_CONTEXT_RESERVE: u32 = 4_096;
 
 #[allow(clippy::too_many_lines)]
 #[allow(clippy::cast_precision_loss)]
-fn main() -> Result<()> {
+fn main() {
     let args = cli::Cli::parse();
+    let terminal = terminal::Terminal::new(!args.no_color);
+
+    if let Err(error) = run(&args, terminal) {
+        terminal.error(&error);
+        std::process::exit(1);
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+#[allow(clippy::cast_precision_loss)]
+fn run(args: &cli::Cli, terminal: terminal::Terminal) -> Result<()> {
     args.validate()?;
     let mode = args.commit_mode();
 
@@ -44,7 +54,6 @@ fn main() -> Result<()> {
         bail!("no staged changes");
     }
 
-    eprintln!("git-scribe: preparing prompt...");
     let prompt = Prompt::new(
         &repo,
         &args.context,
@@ -53,18 +62,17 @@ fn main() -> Result<()> {
         prompt_token_budget,
     )?;
 
-    eprintln!(
-        "git-scribe: {} file(s) in commit, ~{}/{} (~{:.0}%) prompt tokens used, {}",
-        commit.len(),
+    terminal.status(format_args!("{} file(s) in commit", commit.len()));
+    terminal.status(format_args!(
+        "Estimated prompt token usage: {}/{} ({:.0}%)",
         prompt.estimated_tokens,
         prompt_token_budget,
         100.0 * prompt.estimated_tokens as f64 / prompt_token_budget as f64,
-        args.model,
-    );
+    ));
 
     if let Some(path) = &args.context_file {
         prompt.write_context(path)?;
-        eprintln!("git-scribe: wrote model context to {}", path.display());
+        terminal.status(format_args!("Wrote model context to: {}", path.display()));
     }
 
     let client = ollama::Client::default();
@@ -87,18 +95,23 @@ fn main() -> Result<()> {
 
     {
         let loaded = client.list_running_models()?;
-        if is_model_contained(&args.model, args.model_context, &loaded) {
-            eprintln!(
-                "git-scribe: loading {} with a {}-token context...",
+        if !is_model_contained(&args.model, args.model_context, &loaded) {
+            terminal.status(format_args!(
+                "Loading {} with a {}-token context...",
                 args.model, args.model_context
-            );
-            client.prepare_model(&args.model, &chat_options)?;
+            ));
+            if let Some(done) = client.prepare_model(&args.model, &chat_options)?
+                && done != "load"
+            {
+                terminal.warning(format_args!("Unexpected done reason: {done}"));
+            }
         }
     }
-    eprintln!("git-scribe: model ready; processing prompt...");
 
-    let mut thinking_reported = false;
-    let mut generating_reported = false;
+    let mut spinner = terminal::Spinner::default();
+    let mut thinking_started = false;
+    let mut generating_started = false;
+    terminal.status(format_args!("Sending prompt to {}", args.model));
     let response = client.chat_stream(
         &args.model,
         vec![
@@ -114,59 +127,42 @@ fn main() -> Result<()> {
         &chat_options,
         |event| match event {
             ollama::ChatEvent::Thinking(_) => {
-                if thinking_reported {
-                    // eprint!(".");
-                    // std::io::stderr().flush().ok();
-                } else {
-                    thinking_reported = true;
-                    eprint!("git-scribe: model thinking...");
-                    std::io::stderr().flush().ok();
-                }
+                thinking_started = true;
+                terminal.spinner(spinner.next_frame(), format_args!("Thinking"));
             }
             ollama::ChatEvent::Generating(_) => {
-                if generating_reported {
-                    // eprint!(".");
-                    // std::io::stderr().flush().ok();
-                } else {
-                    generating_reported = true;
-                    if thinking_reported {
-                        eprintln!();
-                    }
-                    eprint!("git-scribe: generating commit message...");
-                    std::io::stderr().flush().ok();
+                if thinking_started && !generating_started {
+                    terminal.complete(format_args!("Done thinking."));
                 }
+                generating_started = true;
+                terminal.spinner(
+                    spinner.next_frame(),
+                    format_args!("Generating commit message"),
+                );
             }
         },
     )?;
-    eprintln!();
-
-    if let Some(actual) = response.prompt_eval_count {
-        eprintln!("git-scribe: actually used {actual} prompt tokens");
+    if generating_started {
+        terminal.complete(format_args!("Commit message generated."));
     }
 
-    eprintln!(
-        "git-scribe: generated {} tokens, done reason: {}",
+    terminal.status(format_args!(
+        "Tokens used: {} + {}",
+        response.prompt_eval_count.unwrap_or(0),
         response.eval_count.unwrap_or(0),
-        response.done_reason.as_deref().unwrap_or("./."),
-    );
-
-    if let Some(thinking) = response.message.thinking.as_deref()
-        && !thinking.is_empty()
-    {
-        eprintln!(
-            "git-scribe: model produced {} bytes of thinking",
-            thinking.len(),
-        );
+    ));
+    match response.done_reason.as_deref() {
+        Some("stop") => {}
+        Some("length") => terminal.warning(format_args!("Model output hit the token limit")),
+        Some(done) => terminal.warning(format_args!("Unexpected done reason: {done}")),
+        None => terminal.warning(format_args!("No done reason reported")),
     }
 
     let content = response.message.content.trim();
-
     if content.is_empty() {
         bail!(
-            "model returned an empty response \
-         (generated {} tokens, done reason: {:?}, thinking: {} bytes)",
+            "model returned an empty response (generated {} tokens, thinking: {} bytes)",
             response.eval_count.unwrap_or(0),
-            response.done_reason,
             response.message.thinking.as_deref().map_or(0, str::len),
         );
     }
@@ -181,26 +177,23 @@ fn main() -> Result<()> {
         }
     };
 
-    if response.done_reason.as_deref() == Some("length") {
-        eprintln!("git-scribe: warning: model output hit the token limit");
-    }
     if matches!(answer.confidence, Confidence::Low) {
-        eprintln!(
-            "git-scribe: warning: model reports low confidence ({:?}): {}",
+        terminal.warning(format_args!(
+            "Model reports low confidence ({:?}): {}",
             answer.change_kind, answer.intent,
-        );
+        ));
     }
 
     if args.show_analysis {
-        eprintln!("git-scribe: model analysis:");
-        eprintln!("  intent: {}", answer.intent);
-        eprintln!("  kind: {:?}", answer.change_kind);
-        eprintln!("  confidence: {:?}", answer.confidence);
+        terminal.status(format_args!("Model analysis:"));
+        terminal.status(format_args!("  intent: {}", answer.intent));
+        terminal.status(format_args!("  kind: {:?}", answer.change_kind));
+        terminal.status(format_args!("  confidence: {:?}", answer.confidence));
 
         if !answer.key_changes.is_empty() {
-            eprintln!("  key changes:");
+            terminal.status(format_args!("  key changes:"));
             for change in &answer.key_changes {
-                eprintln!("    - {change}");
+                terminal.status(format_args!("    - {change}"));
             }
         }
     }
@@ -217,7 +210,7 @@ fn main() -> Result<()> {
     if args.print {
         println!("{commit_message}");
     } else {
-        eprintln!("git-scribe: opening the Git commit editor");
+        terminal.status(format_args!("Opening the Git commit editor"));
         repo.commit_interactively(mode, &commit_message)?;
     }
 
