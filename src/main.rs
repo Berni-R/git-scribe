@@ -7,7 +7,8 @@ use anyhow::{Context as _, Result, bail};
 use clap::Parser as _;
 use git_scribe::{
     GitRepo,
-    generation::{CommitMessage, Confidence, Prompt},
+    generation::{CommitMessage, Confidence, Prompt, PromptEstimate},
+    git::ProspectiveCommit,
     ollama::{self, ChatOptions, KeepAlive, Message, ModelOptions, Role, is_model_contained},
     segments,
     terminal::{ChatProgress, Terminal},
@@ -22,7 +23,7 @@ mod cli;
 /// 384 leaves enough room for that worst case without reserving a significant fraction of a typical 16k model context.
 const NUM_PREDICT: i32 = 384;
 
-/// Minimum context reserved for model reasoning and the final response when generation itself is not capped.
+/// Minimum context reserved for model reasoning when thinking is enabled.
 const THINKING_CONTEXT_RESERVE: u32 = 4_096;
 
 #[allow(clippy::too_many_lines)]
@@ -44,13 +45,6 @@ fn run(args: &cli::Cli, terminal: Terminal) -> Result<()> {
     ensure_output_paths_are_available(args)?;
     let mode = args.commit_mode();
 
-    let predict_reserve = if args.think.is_on() {
-        THINKING_CONTEXT_RESERVE
-    } else {
-        NUM_PREDICT as u32
-    };
-    let prompt_token_budget = Prompt::available_tokens(args.model_context, predict_reserve)?;
-
     let repo = GitRepo::discover(&args.path)?;
     let commit = repo.prospective_commit(mode)?;
 
@@ -58,27 +52,72 @@ fn run(args: &cli::Cli, terminal: Terminal) -> Result<()> {
         bail!("no staged changes");
     }
 
-    let prompt = Prompt::new(
+    let stats = commit.stats();
+    terminal.status_segments(segments![
+        BoldNeutral: "{} file(s)", stats.files_changed;
+        Neutral: " in commit; line changes: ";
+        Green: "+{}", stats.insertions;
+        Neutral: " ";
+        Red: "-{}", stats.deletions;
+    ]);
+
+    let (thinking_tokens, generation_tokens, predict_reserve, num_predict) = if args.think.is_on() {
+        (
+            THINKING_CONTEXT_RESERVE as usize,
+            0,
+            THINKING_CONTEXT_RESERVE,
+            None,
+        )
+    } else {
+        (
+            0,
+            NUM_PREDICT as usize,
+            NUM_PREDICT as u32,
+            Some(NUM_PREDICT),
+        )
+    };
+    let estimate = Prompt::estimate(
+        &repo,
+        &args.context,
+        &commit,
+        &args.exclude_diff,
+        thinking_tokens,
+        generation_tokens,
+    )?;
+    let prompt_token_budget = match Prompt::available_tokens(args.model_context, predict_reserve) {
+        Ok(budget) => budget,
+        Err(error) => {
+            return Err(error.context(report_budget_overflow(
+                terminal,
+                &estimate,
+                args.model_context,
+                &commit,
+            )?));
+        }
+    };
+
+    let prompt = match Prompt::new(
         &repo,
         &args.context,
         &commit,
         &args.exclude_diff,
         prompt_token_budget,
-    )?;
+    ) {
+        Ok(prompt) => prompt,
+        Err(error) => {
+            return Err(error.context(report_budget_overflow(
+                terminal,
+                &estimate,
+                args.model_context,
+                &commit,
+            )?));
+        }
+    };
 
-    let stats = commit.stats();
-    terminal.status_segments(segments![
-        Neutral: "{} file(s) in commit; ", stats.files_changed;
-        Neutral: "line changes: ";
-        Green: "+{}", stats.insertions;
-        Neutral: " ";
-        Red: "-{}", stats.deletions;
-    ]);
     let token_bar = Terminal::progress_bar(prompt.estimated_tokens, prompt_token_budget, 25);
-    let prompt_token_percentage = prompt.estimated_tokens.saturating_mul(100) / prompt_token_budget;
     terminal.status(format_args!(
-        "Estimated input budget: {token_bar} {} / {} tokens ({}%)",
-        prompt.estimated_tokens, prompt_token_budget, prompt_token_percentage,
+        "Estimated input budget: {token_bar} {} / {prompt_token_budget} tokens ",
+        prompt.estimated_tokens,
     ));
 
     if let Some(path) = &args.context_file {
@@ -91,11 +130,7 @@ fn run(args: &cli::Cli, terminal: Terminal) -> Result<()> {
         options: Some(ModelOptions {
             temperature: Some(args.temperature),
             num_ctx: Some(args.model_context),
-            num_predict: if args.think.is_on() {
-                None
-            } else {
-                Some(NUM_PREDICT)
-            },
+            num_predict,
             seed: args.seed,
         }),
         think: Some(args.think),
@@ -211,6 +246,97 @@ fn run(args: &cli::Cli, terminal: Terminal) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Render an over-budget estimate and return actionable context-sizing guidance.
+fn report_budget_overflow(
+    terminal: Terminal,
+    estimate: &PromptEstimate,
+    model_context: u32,
+    commit: &ProspectiveCommit,
+) -> Result<String> {
+    let required_context = u32::try_from(estimate.total_tokens())
+        .context("required model context exceeds the supported token range")?;
+    let required_context = 1000 * ((required_context + 500) / 1000);
+    let overflow = estimate
+        .total_tokens()
+        .saturating_sub(model_context as usize);
+    let token_bar =
+        Terminal::progress_bar(estimate.total_tokens(), (model_context as usize).max(1), 25);
+    terminal.status_segments(segments![
+        Neutral: "Estimated context budget: ";
+        DimRed: "{token_bar} {} / {model_context} tokens ({overflow} over)", estimate.total_tokens();
+    ]);
+    let mut budget_parts = vec![
+        format!("system {}", estimate.system_tokens),
+        format!("user {}", estimate.user_tokens),
+    ];
+    if estimate.thinking_tokens > 0 {
+        budget_parts.push(format!("thinking {}", estimate.thinking_tokens));
+    }
+    if estimate.generation_tokens > 0 {
+        budget_parts.push(format!("generation {}", estimate.generation_tokens));
+    }
+    budget_parts.push(format!("safety {}", estimate.safety_margin_tokens));
+    terminal.status(format_args!("  {}", budget_parts.join(" + ")));
+    report_file_change_stats(terminal, commit);
+
+    Ok(format!(
+        "Split the commit, increase --model-context to >~{required_context}, \
+         use (multiple) --exclude-diff, or turn thinking off."
+    ))
+}
+
+/// Render changed-line counts for every file in the prospective commit.
+fn report_file_change_stats(terminal: Terminal, commit: &ProspectiveCommit) {
+    terminal.status(format_args!("Changed lines by file:"));
+    let changes = commit
+        .changes()
+        .iter()
+        .map(|change| {
+            let insertions = change
+                .hunks
+                .iter()
+                .filter_map(|hunk| hunk.after)
+                .map(|range| range.count)
+                .sum::<usize>();
+            let deletions = change
+                .hunks
+                .iter()
+                .filter_map(|hunk| hunk.before)
+                .map(|range| range.count)
+                .sum::<usize>();
+            (
+                change.summary_line().replace('\t', " "),
+                format!("+{insertions}"),
+                format!("-{deletions}"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let insertion_width = changes
+        .iter()
+        .map(|(_, insertions, _)| insertions.len())
+        .max()
+        .unwrap_or(1);
+    let deletion_width = changes
+        .iter()
+        .map(|(_, _, deletions)| deletions.len())
+        .max()
+        .unwrap_or(1);
+    let summary_width = changes
+        .iter()
+        .map(|(summary, _, _)| summary.len())
+        .max()
+        .unwrap_or(0);
+
+    for (summary, insertions, deletions) in changes {
+        terminal.status_segments(segments![
+            Neutral: "  {summary:<summary_width$} | ";
+            Green: "{insertions:>insertion_width$}";
+            Neutral: " ";
+            Red: "{deletions:>deletion_width$}";
+        ]);
+    }
 }
 
 fn write_stream_file(path: &std::path::Path, thinking: Option<&str>, content: &str) -> Result<()> {

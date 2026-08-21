@@ -8,14 +8,18 @@ use time::{OffsetDateTime, format_description::well_known::Iso8601};
 /// The visual treatment for one diagnostic segment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TextStyle {
+    /// Use faint dark-gray text for timestamps.
+    Timestamp,
     /// Use dim diagnostic text.
     Neutral,
     /// Use bold, dim diagnostic text.
     BoldNeutral,
-    /// Use dim green text.
+    /// Use green text.
     Green,
-    /// Use dim red text.
+    /// Use red text.
     Red,
+    /// Use dim red text.
+    DimRed,
     /// Use dim slate-blue text for model reasoning.
     Thinking,
     /// Use orange text.
@@ -73,15 +77,19 @@ pub struct Terminal {
 impl Terminal {
     /// ANSI reset sequence.
     const CLEAR: &str = "\x1b[0m";
+    /// ANSI faint dark-gray sequence for timestamps.
+    const TIMESTAMP: &str = "\x1b[2;38;5;240m";
     // Include foreground 39 explicitly. While SGR 0 nominally restores it, spelling out the
     // default foreground makes neutral segments independent of an immediately adjacent color.
     const NEUTRAL: &str = "\x1b[2;39m";
     /// ANSI bold-neutral sequence.
     const BOLD_NEUTRAL: &str = "\x1b[1;2;39m";
     /// ANSI green sequence.
-    const GREEN: &str = "\x1b[2;32m";
+    const GREEN: &str = "\x1b[32m";
     /// ANSI red sequence.
-    const RED: &str = "\x1b[2;31m";
+    const RED: &str = "\x1b[31m";
+    /// ANSI dim-red sequence.
+    const DIM_RED: &str = "\x1b[2;31m";
     /// ANSI thinking sequence.
     const THINKING: &str = "\x1b[2;38;5;103m";
     /// ANSI orange sequence.
@@ -324,10 +332,12 @@ impl Terminal {
     /// Return the ANSI code for a text style.
     fn style_code(style: TextStyle) -> &'static str {
         match style {
+            TextStyle::Timestamp => Self::TIMESTAMP,
             TextStyle::Neutral => Self::NEUTRAL,
             TextStyle::BoldNeutral => Self::BOLD_NEUTRAL,
             TextStyle::Green => Self::GREEN,
             TextStyle::Red => Self::RED,
+            TextStyle::DimRed => Self::DIM_RED,
             TextStyle::Thinking => Self::THINKING,
             TextStyle::Orange => Self::ORANGE,
             TextStyle::Error => Self::ERROR,
@@ -337,7 +347,7 @@ impl Terminal {
     /// Write the optional local timestamp.
     fn write_timestamp<W: io::Write>(self, output: &mut W) {
         if self.timestamp {
-            self.apply_style(output, TextStyle::Neutral);
+            self.apply_style(output, TextStyle::Timestamp);
             let _ = write!(output, "[{}] ", timestamp());
             self.reset_style(output);
         }
@@ -373,9 +383,9 @@ mod tests {
         assert_eq!(
             String::from_utf8(output).unwrap(),
             concat!(
-                "\x1b[0m\x1b[2;32m+1\x1b[0m",
+                "\x1b[0m\x1b[32m+1\x1b[0m",
                 "\x1b[0m\x1b[2;39m|\x1b[0m",
-                "\x1b[0m\x1b[2;31m-1\x1b[0m",
+                "\x1b[0m\x1b[31m-1\x1b[0m",
             )
         );
     }

@@ -27,6 +27,42 @@ pub struct Prompt {
     pub estimated_tokens: usize,
 }
 
+/// Token budget for a complete model request.
+#[derive(Debug, Clone, Copy)]
+pub struct PromptEstimate {
+    /// Estimated system-message tokens.
+    pub system_tokens: usize,
+
+    /// Estimated user-message tokens.
+    pub user_tokens: usize,
+
+    /// Tokens reserved for model reasoning.
+    pub thinking_tokens: usize,
+
+    /// Tokens reserved for generated output.
+    pub generation_tokens: usize,
+
+    /// Tokens reserved for tokenization and template overhead.
+    pub safety_margin_tokens: usize,
+}
+
+impl PromptEstimate {
+    /// Return estimated input tokens.
+    #[must_use]
+    pub const fn input_tokens(self) -> usize {
+        self.system_tokens + self.user_tokens
+    }
+
+    /// Return the full required model-context budget.
+    #[must_use]
+    pub const fn total_tokens(self) -> usize {
+        self.input_tokens()
+            + self.thinking_tokens
+            + self.generation_tokens
+            + self.safety_margin_tokens
+    }
+}
+
 /// Marker appended when supporting context is clipped.
 const CLIP_SUFFIX: &str = "\n...[clipped for context budget]...";
 
@@ -133,11 +169,7 @@ that is fully supported.
         let fixed = estimate_tokens(&format!("{}{minimal}", Self::SYSTEM));
 
         if fixed > token_budget {
-            bail!(
-                "commit it too large for the model context: \
-                 selected diff + required metadata are ~{fixed} tokens; budget is {token_budget}.\n\
-                 Split the commit, increase the context size, or use `--exclude-diff`."
-            );
+            bail!("prompt needs ~{fixed} tokens; budget is {token_budget}");
         }
 
         let syntax_budget = MAX_SYNTAX_CONTEXT_TOKENS.min(token_budget - fixed);
@@ -182,12 +214,32 @@ that is fully supported.
         let estimated_tokens = estimate_tokens(&format!("{}{text}", Self::SYSTEM));
 
         if estimated_tokens > token_budget {
-            bail!("could not fit prompt safely (~{estimated_tokens} tokens)");
+            bail!("prompt needs ~{estimated_tokens} tokens; budget is {token_budget}");
         }
 
         Ok(Self {
             text,
             estimated_tokens,
+        })
+    }
+
+    /// Estimate the full uncapped request budget.
+    pub fn estimate(
+        repo: &GitRepo,
+        context: &[String],
+        commit: &ProspectiveCommit,
+        excluded_diff_paths: &[PathBuf],
+        thinking_tokens: usize,
+        generation_tokens: usize,
+    ) -> Result<PromptEstimate> {
+        let prompt = Self::new(repo, context, commit, excluded_diff_paths, usize::MAX)?;
+
+        Ok(PromptEstimate {
+            system_tokens: estimate_tokens(Self::SYSTEM),
+            user_tokens: estimate_tokens(&prompt.text),
+            thinking_tokens,
+            generation_tokens,
+            safety_margin_tokens: CONTEXT_MARGIN as usize,
         })
     }
 
@@ -216,19 +268,11 @@ that is fully supported.
     pub fn available_tokens(model_context: u32, generation_reserve: u32) -> Result<usize> {
         let reserved = generation_reserve + CONTEXT_MARGIN;
 
-        let available = model_context.checked_sub(reserved).with_context(|| {
-            format!(
-                "model context ({model_context} tokens) is too small: \
-             {generation_reserve} tokens are reserved for generation and \
-             {CONTEXT_MARGIN} tokens for context-estimation safety"
-            )
-        })?;
-
-        if available == 0 {
-            bail!("model context leaves no room for the prompt");
+        if model_context <= reserved {
+            bail!("context {model_context} cannot reserve {reserved} tokens");
         }
 
-        Ok(available as usize)
+        Ok((model_context - reserved) as usize)
     }
 }
 
