@@ -78,19 +78,19 @@ fn run(args: &cli::Cli, terminal: Terminal) -> Result<()> {
     };
     let estimate = Prompt::estimate(
         &repo,
-        &args.context,
+        &args.hint,
         &commit,
         &args.exclude_diff,
         thinking_tokens,
         generation_tokens,
     )?;
-    let prompt_token_budget = match Prompt::available_tokens(args.model_context, predict_reserve) {
+    let prompt_token_budget = match Prompt::available_tokens(args.context_window, predict_reserve) {
         Ok(budget) => budget,
         Err(error) => {
             return Err(error.context(report_budget_overflow(
                 terminal,
                 &estimate,
-                args.model_context,
+                args.context_window,
                 &commit,
             )?));
         }
@@ -98,7 +98,7 @@ fn run(args: &cli::Cli, terminal: Terminal) -> Result<()> {
 
     let prompt = match Prompt::new(
         &repo,
-        &args.context,
+        &args.hint,
         &commit,
         &args.exclude_diff,
         prompt_token_budget,
@@ -108,7 +108,7 @@ fn run(args: &cli::Cli, terminal: Terminal) -> Result<()> {
             return Err(error.context(report_budget_overflow(
                 terminal,
                 &estimate,
-                args.model_context,
+                args.context_window,
                 &commit,
             )?));
         }
@@ -120,7 +120,7 @@ fn run(args: &cli::Cli, terminal: Terminal) -> Result<()> {
         prompt.estimated_tokens,
     ));
 
-    if let Some(path) = &args.context_file {
+    if let Some(path) = &args.prompt_file {
         prompt.write_context(path)?;
         terminal.status(format_args!("Wrote model context to: {}", path.display()));
     }
@@ -129,7 +129,7 @@ fn run(args: &cli::Cli, terminal: Terminal) -> Result<()> {
     let chat_options = ChatOptions {
         options: Some(ModelOptions {
             temperature: Some(args.temperature),
-            num_ctx: Some(args.model_context),
+            num_ctx: Some(args.context_window),
             num_predict,
             seed: args.seed,
         }),
@@ -141,11 +141,11 @@ fn run(args: &cli::Cli, terminal: Terminal) -> Result<()> {
 
     {
         let loaded = client.list_running_models()?;
-        if !is_model_contained(&args.model, args.model_context, &loaded) {
+        if !is_model_contained(&args.model, args.context_window, &loaded) {
             terminal.status_segments(segments![
                 Neutral: "Loading ";
                 BoldNeutral: "{}", args.model;
-                Neutral: " with a {} token context...", args.model_context;
+                Neutral: " with a {} token context...", args.context_window;
             ]);
             if let Some(done) = client.prepare_model(&args.model, &chat_options)?
                 && done != "load"
@@ -282,7 +282,7 @@ fn report_budget_overflow(
     report_file_change_stats(terminal, commit);
 
     Ok(format!(
-        "Split the commit, increase --model-context to >~{required_context}, \
+        "Split the commit, increase --context-window to >~{required_context}, \
          use (multiple) --exclude-diff, or turn thinking off."
     ))
 }
@@ -349,16 +349,16 @@ fn write_stream_file(path: &std::path::Path, thinking: Option<&str>, content: &s
 }
 
 fn ensure_output_paths_are_available(args: &cli::Cli) -> Result<()> {
-    if let (Some(context_file), Some(stream_file)) = (&args.context_file, &args.stream_file)
-        && context_file == stream_file
+    if let (Some(prompt_file), Some(stream_file)) = (&args.prompt_file, &args.stream_file)
+        && prompt_file == stream_file
     {
         bail!(
-            "--context-file and --stream-file must name different files ({})",
-            context_file.display(),
+            "--prompt-file and --stream-file must name different files ({})",
+            prompt_file.display(),
         );
     }
 
-    for path in [args.context_file.as_deref(), args.stream_file.as_deref()]
+    for path in [args.prompt_file.as_deref(), args.stream_file.as_deref()]
         .into_iter()
         .flatten()
     {

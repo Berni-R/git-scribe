@@ -3,6 +3,34 @@ use std::{path::PathBuf, time::Duration};
 use clap::Parser;
 use git_scribe::{git::CommitMode, ollama::Think};
 
+/// Parse a token count with optional `k` or `m` binary suffixes.
+fn parse_token_count(value: &str) -> Result<u32, String> {
+    let value = value.replace('_', "");
+    let (number, multiplier) = value
+        .strip_suffix('k')
+        .or_else(|| value.strip_suffix('K'))
+        .map_or_else(
+            || {
+                value
+                    .strip_suffix('m')
+                    .or_else(|| value.strip_suffix('M'))
+                    .map_or((&value[..], 1), |number| (number, 1024 * 1024))
+            },
+            |number| (number, 1024),
+        );
+    let number = number
+        .parse::<u32>()
+        .map_err(|_| format!("expected a positive token count such as `64k`, got `{value}`"))?;
+    let tokens = number
+        .checked_mul(multiplier)
+        .ok_or_else(|| format!("token count `{value}` exceeds the supported range"))?;
+
+    if tokens == 0 {
+        return Err("token count must be positive".to_owned());
+    }
+    Ok(tokens)
+}
+
 #[derive(Debug, Parser)]
 #[command(
     version,
@@ -14,87 +42,111 @@ pub struct Cli {
     #[arg(value_name = "PATH", default_value = ".")]
     pub path: PathBuf,
 
-    /// Generate a message for amending the current HEAD commit.
-    #[arg(long)]
+    /// Generate a message for amending HEAD.
+    ///
+    /// Uses staged changes and compares them with HEAD's first parent. Merge commits are unsupported.
+    #[arg(long, help_heading = "Commit")]
     pub amend: bool,
 
-    /// Optional context or hints about the commit.
-    #[arg(long, value_name = "TEXT")]
-    pub context: Vec<String>,
-
-    /// Exclude a repository-relative file from the concrete and syntax diffs in the prompt.
-    ///
-    /// The file's added, modified, or deleted status remains available to the model.
-    #[arg(long = "exclude-diff", value_name = "PATH")]
-    pub exclude_diff: Vec<PathBuf>,
-
-    /// Ollama model to use (e.g. "gemma4:e2b" or "qwen3:4b-instruct").
-    ///
-    /// Note:
-    /// As of now (Aug 2026), models using Apple MLX framework do not respect the output format with Ollama.
-    ///
-    /// See <https://github.com/ollama/ollama/issues/16563>.
-    #[arg(short, long, default_value = "qwen3.5:9b")]
-    pub model: String,
-
-    /// Use only the generated one-line subject, omitting the body.
-    #[arg(short, long)]
-    pub no_body: bool,
-
-    /// Print the generated message instead of creating a commit.
-    #[arg(short, long)]
+    /// Print the generated message instead of opening Git's editor.
+    #[arg(short, long, help_heading = "Commit")]
     pub print: bool,
 
-    /// Disable ANSI colors in diagnostic output.
-    #[arg(long)]
-    pub no_color: bool,
+    /// Use only the generated one-line subject.
+    #[arg(short, long, help_heading = "Commit")]
+    pub no_body: bool,
 
-    /// Suppress progress output and print only the generated message.
-    #[arg(short = 'q', long = "quite", alias = "quiet")]
-    pub quiet: bool,
+    /// Add an author-provided hint about the commit.
+    ///
+    /// Repeat to provide intent or motivation that is not evident from the staged diff.
+    #[arg(long, value_name = "TEXT", help_heading = "Prompt")]
+    pub hint: Vec<String>,
 
-    /// Model context window, in tokens.
-    #[arg(short = 'c', long, default_value_t = 16_384)]
-    pub model_context: u32,
+    /// Omit a repository-relative file's diff and syntax context from the prompt.
+    ///
+    /// The file's status remains visible. Repeat to exclude multiple files.
+    #[arg(short = 'x', long, value_name = "PATH", help_heading = "Prompt")]
+    pub exclude_diff: Vec<PathBuf>,
 
-    /// Sampling temperature used by the model.
-    #[arg(short, long, default_value_t = 0.0)]
-    pub temperature: f32,
+    /// Ollama model name; it must already be available in Ollama.
+    #[arg(short, long, default_value = "qwen3.5:9b", help_heading = "Model")]
+    pub model: String,
 
-    /// Random seed used for reproducible outputs, if given.
-    #[arg(long)]
-    pub seed: Option<i64>,
+    /// Maximum model context window in tokens.
+    ///
+    /// Supports binary suffixes: `k` is 1024 and `m` is 1024²; for example, `-c 64k` or `-c 2m`.
+    /// The window includes prompt, reasoning, generated output, and safety reserves.
+    #[arg(
+        short = 'c',
+        long,
+        value_name = "TOKENS",
+        default_value = "16k",
+        value_parser = parse_token_count,
+        help_heading = "Model"
+    )]
+    pub context_window: u32,
 
     /// Whether and how strongly the model should use explicit thinking.
-    #[arg(long, value_enum, default_value_t = Think::Off)]
+    ///
+    /// Use `--think` or `-T` for `on`; use `--think=high` for a level.
+    #[arg(
+        short = 'T',
+        long,
+        value_enum,
+        default_value_t = Think::Off,
+        default_missing_value = "on",
+        num_args = 0..=1,
+        require_equals = true,
+        help_heading = "Model"
+    )]
     pub think: Think,
 
     /// Show the latest five lines of the streamed model reasoning trace.
-    #[arg(long)]
+    ///
+    /// Requires thinking to be enabled with `--think`.
+    #[arg(long, help_heading = "Model")]
     pub show_thinking: bool,
 
-    /// Write the complete thinking trace and generated response to this file.
-    #[arg(long, value_name = "FILE")]
-    pub stream_file: Option<PathBuf>,
-
-    /// Keep the Ollama model alive after execution.
+    /// Sampling temperature.
     ///
-    /// A value of `0` unloads the model immediately.
-    /// If not specified, use the Ollama default.
-    #[arg(short, long, value_parser = humantime::parse_duration)]
+    /// Lower values are more deterministic.
+    #[arg(short, long, default_value_t = 0.0, help_heading = "Model")]
+    pub temperature: f32,
+
+    /// Random seed for reproducible output on supported models.
+    #[arg(long, help_heading = "Model")]
+    pub seed: Option<i64>,
+
+    /// Keep the Ollama model loaded after execution.
+    ///
+    /// Accepts durations such as `30s`, `2m`, and `1h`. Use `0s` to unload it immediately;
+    /// omit to use Ollama's default.
+    #[arg(short, long, value_parser = humantime::parse_duration, help_heading = "Runtime")]
     pub keep_alive: Option<Duration>,
 
-    /// Maximum time to wait for Ollama to respond.
-    #[arg(long, value_parser = humantime::parse_duration, default_value = "2m")]
+    /// Maximum time to wait for Ollama to respond, such as `30s`, `2m`, or `1h`.
+    #[arg(long, value_parser = humantime::parse_duration, default_value = "2m", help_heading = "Runtime")]
     pub timeout: Duration,
 
     /// Print the model's structured analysis to stderr.
-    #[arg(long)]
+    #[arg(long, help_heading = "Diagnostics")]
     pub show_analysis: bool,
 
-    /// Write the complete generated model context to this file.
-    #[arg(long, value_name = "FILE")]
-    pub context_file: Option<PathBuf>,
+    /// Write the system and user prompt sent to the model.
+    #[arg(long, value_name = "FILE", help_heading = "Diagnostics")]
+    pub prompt_file: Option<PathBuf>,
+
+    /// Write the complete streamed thinking trace and generated response to this file.
+    #[arg(long, value_name = "FILE", help_heading = "Diagnostics")]
+    pub stream_file: Option<PathBuf>,
+
+    /// Disable ANSI colors in diagnostic output.
+    #[arg(long, help_heading = "Diagnostics")]
+    pub no_color: bool,
+
+    /// Suppress progress diagnostics; errors are still shown.
+    #[arg(short = 'q', long, help_heading = "Diagnostics")]
+    pub quiet: bool,
 }
 
 impl Cli {
@@ -169,25 +221,50 @@ mod tests {
     #[test]
     fn quiet_flag_suppresses_progress_output() {
         let short = Cli::try_parse_from(["git-scribe", "-q"]).unwrap();
-        let long = Cli::try_parse_from(["git-scribe", "--quite"]).unwrap();
-        let conventional = Cli::try_parse_from(["git-scribe", "--quiet"]).unwrap();
+        let long = Cli::try_parse_from(["git-scribe", "--quiet"]).unwrap();
 
         assert!(short.quiet);
         assert!(long.quiet);
-        assert!(conventional.quiet);
+        assert!(Cli::try_parse_from(["git-scribe", "--quite"]).is_err());
     }
 
     #[test]
-    fn thinking_display_and_stream_file_are_parsed() {
+    fn hints_and_diagnostic_files_are_parsed() {
         let cli = Cli::try_parse_from([
             "git-scribe",
+            "--hint",
+            "explain the migration",
             "--show-thinking",
+            "--prompt-file",
+            "prompt.txt",
             "--stream-file",
             "response.txt",
         ])
         .unwrap();
 
+        assert_eq!(cli.hint, ["explain the migration"]);
         assert!(cli.show_thinking);
+        assert_eq!(cli.prompt_file, Some(PathBuf::from("prompt.txt")));
         assert_eq!(cli.stream_file, Some(PathBuf::from("response.txt")));
+    }
+
+    #[test]
+    fn context_window_accepts_binary_suffixes() {
+        let cli = Cli::try_parse_from(["git-scribe", "-c", "64k"]).unwrap();
+
+        assert_eq!(cli.context_window, 65_536);
+        assert_eq!(parse_token_count("2m"), Ok(2_097_152));
+        assert!(parse_token_count("0").is_err());
+    }
+
+    #[test]
+    fn thinking_flag_defaults_to_on_when_its_value_is_omitted() {
+        let long = Cli::try_parse_from(["git-scribe", "--think"]).unwrap();
+        let short = Cli::try_parse_from(["git-scribe", "-T"]).unwrap();
+        let level = Cli::try_parse_from(["git-scribe", "--think=high"]).unwrap();
+
+        assert_eq!(long.think, Think::On);
+        assert_eq!(short.think, Think::On);
+        assert_eq!(level.think, Think::High);
     }
 }

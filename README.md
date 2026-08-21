@@ -16,7 +16,7 @@ It combines the staged diff with a small amount of relevant context, including:
 This helps distinguish, for example, a timeout change in production networking code from one made to stabilize a test.
 
 `git-scribe` is written in Rust;
-runs locally through [Ollama](https://ollama.com/) and currently uses `qwen3.5:4b`.
+runs locally through [Ollama](https://ollama.com/) and currently uses `qwen3.5:9b`.
 
 ## Usage
 
