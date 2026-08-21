@@ -4,6 +4,7 @@ use std::{
 };
 
 use crate::ollama::{ChatEvent, ChatResponse};
+use crate::segments;
 
 use super::{Segment, Spinner, Terminal, TextStyle};
 
@@ -29,9 +30,9 @@ impl ChatProgress {
     /// Start displaying progress for a prompt being sent to `model`.
     #[must_use]
     pub fn new(terminal: Terminal, model: &str, show_thinking: bool) -> Self {
-        terminal.status_segments([
-            Segment::text(TextStyle::Neutral, format_args!("Sending prompt to ")),
-            Segment::text(TextStyle::BoldNeutral, format_args!("{model}")),
+        terminal.status_segments(segments![
+            Neutral: "Sending prompt to ";
+            BoldNeutral: "{model}";
         ]);
         terminal.status(format_args!("Waiting for Ollama..."));
 

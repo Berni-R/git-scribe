@@ -9,7 +9,8 @@ use git_scribe::{
     GitRepo,
     generation::{CommitMessage, Confidence, Prompt},
     ollama::{self, ChatOptions, KeepAlive, Message, ModelOptions, Role, is_model_contained},
-    terminal::{ChatProgress, Segment, Terminal, TextStyle},
+    segments,
+    terminal::{ChatProgress, Terminal},
 };
 
 mod cli;
@@ -66,15 +67,12 @@ fn run(args: &cli::Cli, terminal: Terminal) -> Result<()> {
     )?;
 
     let stats = commit.stats();
-    terminal.status_segments([
-        Segment::text(
-            TextStyle::Neutral,
-            format_args!("{} file(s) in commit; ", stats.files_changed),
-        ),
-        Segment::text(TextStyle::Neutral, format_args!("line changes: ")),
-        Segment::text(TextStyle::Green, format_args!("+{}", stats.insertions)),
-        Segment::text(TextStyle::Neutral, format_args!(" ")),
-        Segment::text(TextStyle::Red, format_args!("-{}", stats.deletions)),
+    terminal.status_segments(segments![
+        Neutral: "{} file(s) in commit; ", stats.files_changed;
+        Neutral: "line changes: ";
+        Green: "+{}", stats.insertions;
+        Neutral: " ";
+        Red: "-{}", stats.deletions;
     ]);
     let token_bar = Terminal::progress_bar(prompt.estimated_tokens, prompt_token_budget, 25);
     let prompt_token_percentage = prompt.estimated_tokens.saturating_mul(100) / prompt_token_budget;
@@ -109,13 +107,10 @@ fn run(args: &cli::Cli, terminal: Terminal) -> Result<()> {
     {
         let loaded = client.list_running_models()?;
         if !is_model_contained(&args.model, args.model_context, &loaded) {
-            terminal.status_segments([
-                Segment::text(TextStyle::Neutral, format_args!("Loading ")),
-                Segment::text(TextStyle::BoldNeutral, format_args!("{}", args.model)),
-                Segment::text(
-                    TextStyle::Neutral,
-                    format_args!(" with a {} token context...", args.model_context),
-                ),
+            terminal.status_segments(segments![
+                Neutral: "Loading ";
+                BoldNeutral: "{}", args.model;
+                Neutral: " with a {} token context...", args.model_context;
             ]);
             if let Some(done) = client.prepare_model(&args.model, &chat_options)?
                 && done != "load"
