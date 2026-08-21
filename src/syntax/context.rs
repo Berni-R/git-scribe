@@ -1,7 +1,10 @@
-use std::{collections::HashSet, path::PathBuf};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+};
 
 use anyhow::{Context as _, Result};
-use tree_sitter::{Node, Parser, Point};
+use tree_sitter::{Node, Parser, Point, Query, QueryCursor, StreamingIterator};
 
 use crate::{
     GitRepo,
@@ -16,6 +19,8 @@ const MAX_ENTRIES_PER_SIDE: usize = 12;
 const MAX_ITEMS_PER_ENTRY: usize = 4;
 /// Maximum bytes retained for one declaration.
 const MAX_DECLARATION_BYTES: usize = 400;
+/// Maximum call sites retained for one changed declaration.
+const MAX_CALL_SITES_PER_ENTRY: usize = 3;
 
 /// One useful source-derived construct associated with changed lines.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,6 +39,15 @@ pub struct SyntaxEntry {
     pub items: Vec<SyntaxItem>,
 }
 
+/// One direct call to a changed function or method.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyntaxCallSite {
+    /// Enclosing declaration chain of the caller.
+    pub caller: SyntaxEntry,
+    /// Source line containing the call.
+    pub call: String,
+}
+
 /// Structural evidence for one available side of a changed file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyntaxSide {
@@ -41,6 +55,8 @@ pub struct SyntaxSide {
     pub path: PathBuf,
     /// Extracted declaration chains.
     pub entries: Vec<SyntaxEntry>,
+    /// Direct same-file callers of changed functions or methods.
+    pub call_sites: Vec<SyntaxCallSite>,
 }
 
 /// Structural evidence associated with the changed lines of one file.
@@ -106,6 +122,25 @@ struct SourceSide {
     ranges: Vec<LineRange>,
 }
 
+/// Definition metadata indexed by source-byte range.
+type DefinitionIndex = HashMap<(usize, usize), Definition>;
+
+/// A definition identified by a Tree-sitter tag query.
+struct Definition {
+    /// Declared symbol name.
+    name: String,
+    /// Whether this definition can be called directly.
+    callable: bool,
+}
+
+/// Extracted structure for one source side.
+struct ExtractedContext {
+    /// Declaration chains around changed lines.
+    entries: Vec<SyntaxEntry>,
+    /// Direct callers of changed functions and methods.
+    call_sites: Vec<SyntaxCallSite>,
+}
+
 fn load_side(
     repo: &GitRepo,
     version: Option<&FileVersion>,
@@ -137,9 +172,11 @@ fn detect_side(side: &SourceSide) -> Option<Language> {
 
 /// Analyze one source side into declaration context.
 fn analyze_side(side: SourceSide, language: Language) -> Result<SyntaxSide> {
+    let extracted = extract_context(&side.source, language, &side.ranges)?;
     Ok(SyntaxSide {
         path: side.version.path,
-        entries: context_for_ranges(&side.source, language, &side.ranges)?,
+        entries: extracted.entries,
+        call_sites: extracted.call_sites,
     })
 }
 
@@ -149,8 +186,20 @@ pub fn context_for_ranges(
     language: Language,
     ranges: &[LineRange],
 ) -> Result<Vec<SyntaxEntry>> {
+    Ok(extract_context(source, language, ranges)?.entries)
+}
+
+/// Extract declaration chains and caller context around changed line ranges.
+fn extract_context(
+    source: &[u8],
+    language: Language,
+    ranges: &[LineRange],
+) -> Result<ExtractedContext> {
     if ranges.is_empty() {
-        return Ok(Vec::new());
+        return Ok(ExtractedContext {
+            entries: Vec::new(),
+            call_sites: Vec::new(),
+        });
     }
 
     let mut parser = Parser::new();
@@ -161,19 +210,22 @@ pub fn context_for_ranges(
         .parse(source, None)
         .context("Tree-sitter failed to parse source")?;
     let root = tree.root_node();
+    let definitions = definition_index(root, source, language)?;
     let lines = source.split(|&byte| byte == b'\n').collect::<Vec<_>>();
 
     let mut entries = Vec::new();
     let mut seen = HashSet::new();
+    let mut changed_symbols = HashSet::new();
     'ranges: for range in ranges {
         for row in changed_rows(*range, lines.len()) {
             let Some(focus) = focus_on_row(root, &lines, row) else {
                 continue;
             };
-            let (key, entry) = syntax_entry(source, focus, language, row);
+            let (key, entry, symbols) = syntax_entry(source, focus, language, row, &definitions);
             if entry.items.is_empty() || !seen.insert(key) {
                 continue;
             }
+            changed_symbols.extend(symbols);
             entries.push(entry);
             if entries.len() == MAX_ENTRIES_PER_SIDE {
                 break 'ranges;
@@ -181,7 +233,10 @@ pub fn context_for_ranges(
         }
     }
 
-    Ok(entries)
+    Ok(ExtractedContext {
+        call_sites: call_sites(source, root, language, &definitions, &changed_symbols),
+        entries,
+    })
 }
 
 /// Convert a line range to bounded zero-based rows.
@@ -209,13 +264,21 @@ fn syntax_entry(
     focus: Node<'_>,
     language: Language,
     changed_row: usize,
-) -> (Vec<(usize, usize)>, SyntaxEntry) {
+    definitions: &DefinitionIndex,
+) -> (Vec<(usize, usize)>, SyntaxEntry, Vec<String>) {
     let mut items = Vec::new();
+    let mut symbols = Vec::new();
     let mut current = Some(focus);
     while let Some(node) = current {
-        if let Some(item) = syntax_item(source, node, language)
+        if let Some(item) = syntax_item(source, node, language, definitions)
             && (!is_control_flow(node) || control_header_contains(node, changed_row))
         {
+            if let Some(definition) = definitions
+                .get(&node_key(node))
+                .filter(|definition| definition.callable)
+            {
+                symbols.push(definition.name.clone());
+            }
             items.push((node.start_byte(), node.end_byte(), item));
         }
         current = node.parent();
@@ -227,7 +290,7 @@ fn syntax_entry(
 
     let key = items.iter().map(|(start, end, _)| (*start, *end)).collect();
     let items = items.into_iter().map(|(_, _, item)| item).collect();
-    (key, SyntaxEntry { items })
+    (key, SyntaxEntry { items }, symbols)
 }
 
 /// Check whether a changed row belongs to a control-flow header.
@@ -241,8 +304,13 @@ fn control_header_contains(node: Node<'_>, changed_row: usize) -> bool {
 }
 
 /// Convert a syntax node into a compact semantic item.
-fn syntax_item(source: &[u8], node: Node<'_>, language: Language) -> Option<SyntaxItem> {
-    if !is_context_node(node, language) {
+fn syntax_item(
+    source: &[u8],
+    node: Node<'_>,
+    language: Language,
+    definitions: &DefinitionIndex,
+) -> Option<SyntaxItem> {
+    if !is_context_node(node, language, definitions) {
         return None;
     }
 
@@ -257,31 +325,36 @@ fn syntax_item(source: &[u8], node: Node<'_>, language: Language) -> Option<Synt
 }
 
 /// Check whether a node provides useful enclosing source context.
-fn is_context_node(node: Node<'_>, language: Language) -> bool {
+fn is_context_node(node: Node<'_>, language: Language, definitions: &DefinitionIndex) -> bool {
+    if language == Language::Rust {
+        return definitions.contains_key(&node_key(node))
+            || matches!(
+                node.kind(),
+                "impl_item"
+                    | "function_signature_item"
+                    | "field_declaration"
+                    | "const_item"
+                    | "static_item"
+            )
+            || is_control_flow(node);
+    }
+
     ["body", "consequence", "name"]
         .into_iter()
         .any(|field| node.child_by_field_name(field).is_some())
-        || node.kind().contains("import")
-        || node.kind().contains("include")
         || matches!(
             (language, node.kind()),
-            (Language::Rust, "use_declaration")
-                | (
-                    Language::Toml | Language::Json,
-                    "pair" | "table" | "table_array_element"
-                )
-                | (
-                    Language::Css,
-                    "rule_set"
-                        | "media_statement"
-                        | "supports_statement"
-                        | "scope_statement"
-                        | "keyframes_statement"
-                )
-                | (
-                    Language::Html,
-                    "element" | "script_element" | "style_element"
-                )
+            (
+                Language::Css,
+                "rule_set"
+                    | "media_statement"
+                    | "supports_statement"
+                    | "scope_statement"
+                    | "keyframes_statement"
+            ) | (
+                Language::Html,
+                "element" | "script_element" | "style_element"
+            )
         )
 }
 
@@ -302,6 +375,155 @@ fn is_control_flow(node: Node<'_>) -> bool {
             | "switch_statement"
             | "match_statement"
     )
+}
+
+/// Build a source-range index of Rust definitions from the grammar's tag query.
+fn definition_index(root: Node<'_>, source: &[u8], language: Language) -> Result<DefinitionIndex> {
+    if language != Language::Rust {
+        return Ok(DefinitionIndex::new());
+    }
+
+    let query = Query::new(&language.tree_sitter(), tree_sitter_rust::TAGS_QUERY)
+        .context("failed to load Rust Tree-sitter tag query")?;
+    let capture_names = query.capture_names();
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(&query, root, source);
+    let mut definitions = DefinitionIndex::new();
+
+    while let Some(query_match) = matches.next() {
+        let definition = query_match
+            .captures
+            .iter()
+            .find(|capture| capture_names[capture.index as usize].starts_with("definition."));
+        let name = query_match
+            .captures
+            .iter()
+            .find(|capture| capture_names[capture.index as usize] == "name");
+        let (Some(definition), Some(name)) = (definition, name) else {
+            continue;
+        };
+        let Ok(name) = name.node.utf8_text(source) else {
+            continue;
+        };
+        let capture_name = capture_names[definition.index as usize];
+        definitions.insert(
+            node_key(definition.node),
+            Definition {
+                name: name.to_owned(),
+                callable: matches!(capture_name, "definition.function" | "definition.method"),
+            },
+        );
+    }
+
+    Ok(definitions)
+}
+
+/// Find bounded direct same-file callers of changed Rust functions and methods.
+fn call_sites(
+    source: &[u8],
+    root: Node<'_>,
+    language: Language,
+    definitions: &DefinitionIndex,
+    changed_symbols: &HashSet<String>,
+) -> Vec<SyntaxCallSite> {
+    if language != Language::Rust || changed_symbols.is_empty() {
+        return Vec::new();
+    }
+
+    let Ok(query) = Query::new(&language.tree_sitter(), tree_sitter_rust::TAGS_QUERY) else {
+        return Vec::new();
+    };
+    let capture_names = query.capture_names();
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(&query, root, source);
+    let mut sites = Vec::new();
+    let mut seen = HashSet::new();
+
+    while let Some(query_match) = matches.next() {
+        let reference = query_match
+            .captures
+            .iter()
+            .find(|capture| capture_names[capture.index as usize] == "reference.call");
+        let name = query_match
+            .captures
+            .iter()
+            .find(|capture| capture_names[capture.index as usize] == "name");
+        let (Some(reference), Some(name)) = (reference, name) else {
+            continue;
+        };
+        if reference
+            .node
+            .child_by_field_name("function")
+            .is_none_or(|function| function.kind() != "identifier")
+        {
+            continue;
+        }
+        let Ok(name) = name.node.utf8_text(source) else {
+            continue;
+        };
+        if !changed_symbols.contains(name) {
+            continue;
+        }
+        let Some((caller_node, caller_symbol)) = enclosing_caller(reference.node, definitions)
+        else {
+            continue;
+        };
+        if caller_symbol == name {
+            continue;
+        }
+
+        let (_, caller, _) = syntax_entry(
+            source,
+            caller_node,
+            language,
+            caller_node.start_position().row,
+            definitions,
+        );
+        let Some(call) = source_line(source, reference.node.start_position().row) else {
+            continue;
+        };
+        let key = (node_key(caller_node), reference.node.start_byte());
+        if !seen.insert(key) {
+            continue;
+        }
+        sites.push(SyntaxCallSite { caller, call });
+        if sites.len() == MAX_CALL_SITES_PER_ENTRY {
+            break;
+        }
+    }
+
+    sites
+}
+
+/// Find the callable definition enclosing a node.
+fn enclosing_caller<'tree, 'definitions>(
+    node: Node<'tree>,
+    definitions: &'definitions DefinitionIndex,
+) -> Option<(Node<'tree>, &'definitions str)> {
+    let mut current = node.parent();
+    while let Some(node) = current {
+        if let Some(definition) = definitions
+            .get(&node_key(node))
+            .filter(|definition| definition.callable)
+        {
+            return Some((node, &definition.name));
+        }
+        current = node.parent();
+    }
+    None
+}
+
+/// Return a trimmed source line by zero-based row.
+fn source_line(source: &[u8], row: usize) -> Option<String> {
+    let line = source.split(|&byte| byte == b'\n').nth(row)?;
+    let line = String::from_utf8_lossy(line);
+    let line = line.trim();
+    (!line.is_empty() && line.len() <= MAX_DECLARATION_BYTES).then(|| line.to_owned())
+}
+
+/// Return a stable key for one syntax node.
+fn node_key(node: Node<'_>) -> (usize, usize) {
+    (node.start_byte(), node.end_byte())
 }
 
 /// Find the end of a compact declaration.
@@ -451,16 +673,14 @@ mod tests {
     }
 
     #[test]
-    fn imports_and_constants_are_retained_as_context() {
-        let cases = [
-            ("use crate::client::Client;\n", "use crate::client::Client;"),
-            ("const TIMEOUT: u64 = 120;\n", "const TIMEOUT: u64 ="),
-        ];
+    fn imports_are_omitted_but_constants_are_retained() {
+        assert!(rust_context("use crate::client::Client;\n", &[(1, 1)]).is_empty());
 
-        for (source, expected) in cases {
-            let entries = rust_context(source, &[(1, 1)]);
-            assert_eq!(entries[0].items.last().unwrap().declaration, expected);
-        }
+        let entries = rust_context("const TIMEOUT: u64 = 120;\n", &[(1, 1)]);
+        assert_eq!(
+            entries[0].items.last().unwrap().declaration,
+            "const TIMEOUT: u64 ="
+        );
     }
 
     #[test]
@@ -531,6 +751,38 @@ mod tests {
     }
 
     #[test]
+    fn references_are_not_rendered_as_declarations() {
+        let source = "fn terminal_width() -> usize {\n    env::var(\"COLUMNS\").unwrap().parse().unwrap()\n}\n";
+        let entries = rust_context(source, &[(2, 1)]);
+
+        assert_eq!(declarations(&entries[0]), ["fn terminal_width() -> usize"]);
+    }
+
+    #[test]
+    fn changed_function_includes_direct_same_file_caller() {
+        let source = "struct ChatProgress;\n\nimpl ChatProgress {\n    fn new() -> Self {\n        let width = thinking_preview_columns();\n        Self\n    }\n}\n\nfn thinking_preview_columns() -> usize {\n    72\n}\n";
+        let ranges = [LineRange {
+            start: 11,
+            count: 1,
+        }];
+        let extracted = extract_context(source.as_bytes(), Language::Rust, &ranges).unwrap();
+
+        assert_eq!(
+            declarations(&extracted.entries[0]),
+            ["fn thinking_preview_columns() -> usize"]
+        );
+        assert_eq!(extracted.call_sites.len(), 1);
+        assert_eq!(
+            declarations(&extracted.call_sites[0].caller),
+            ["impl ChatProgress", "fn new() -> Self"]
+        );
+        assert_eq!(
+            extracted.call_sites[0].call,
+            "let width = thinking_preview_columns();"
+        );
+    }
+
+    #[test]
     fn large_function_body_is_not_rendered() {
         let mut source = String::from("fn large() {\n");
         for number in 1..=200 {
@@ -585,8 +837,6 @@ mod tests {
             (Language::Tsx, "function F() {\n    return <div />;\n}\n", 2),
             (Language::Css, ".item {\n    color: red;\n}\n", 2),
             (Language::Html, "<main>\n  <p>changed</p>\n</main>\n", 2),
-            (Language::Toml, "[client]\ntimeout = 120\n", 2),
-            (Language::Json, "{\n  \"timeout\": 120\n}\n", 2),
         ];
 
         for (language, source, line) in cases {
@@ -600,6 +850,22 @@ mod tests {
             )
             .unwrap();
             assert!(!entries.is_empty(), "missing context for {language:?}");
+        }
+    }
+
+    #[test]
+    fn configuration_pairs_are_omitted_as_redundant_diff_context() {
+        for (language, source) in [
+            (Language::Toml, "[client]\ntimeout = 120\n"),
+            (Language::Json, "{\n  \"timeout\": 120\n}\n"),
+        ] {
+            let entries = context_for_ranges(
+                source.as_bytes(),
+                language,
+                &[LineRange { start: 2, count: 1 }],
+            )
+            .unwrap();
+            assert!(entries.is_empty(), "unexpected context for {language:?}");
         }
     }
 }

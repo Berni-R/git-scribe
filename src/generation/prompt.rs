@@ -11,7 +11,7 @@ use anyhow::{Context as _, Result, bail};
 use crate::{
     GitRepo,
     git::{CommitChange, CommitMode, ProspectiveCommit},
-    syntax::{SyntaxContext, SyntaxEntry, SyntaxItem, context_for_change},
+    syntax::{SyntaxCallSite, SyntaxContext, SyntaxEntry, SyntaxItem, context_for_change},
 };
 
 /// Model context for commit-message generation together with its estimated token cost.
@@ -499,25 +499,28 @@ fn render_syntax_context(context: &SyntaxContext) -> String {
     let before = context
         .before
         .as_ref()
-        .filter(|side| !side.entries.is_empty());
+        .filter(|side| !side.entries.is_empty() || !side.call_sites.is_empty());
     let after = context
         .after
         .as_ref()
-        .filter(|side| !side.entries.is_empty());
+        .filter(|side| !side.entries.is_empty() || !side.call_sites.is_empty());
 
     match (before, after) {
         (Some(before), Some(after)) if same_entries(&before.entries, &after.entries) => {
             rendered.push_str("\nCONTEXT:\n");
             render_entries(&mut rendered, &after.entries);
+            render_call_sites(&mut rendered, &after.call_sites);
         }
         (before, after) => {
             if let Some(before) = before {
                 rendered.push_str("\nBEFORE:\n");
                 render_entries(&mut rendered, &before.entries);
+                render_call_sites(&mut rendered, &before.call_sites);
             }
             if let Some(after) = after {
                 rendered.push_str("\nAFTER:\n");
                 render_entries(&mut rendered, &after.entries);
+                render_call_sites(&mut rendered, &after.call_sites);
             }
         }
     }
@@ -552,6 +555,28 @@ fn render_entries(output: &mut String, entries: &[SyntaxEntry]) {
             }
         }
         previous = &entry.items;
+    }
+}
+
+/// Append direct caller context for changed functions and methods.
+fn render_call_sites(output: &mut String, call_sites: &[SyntaxCallSite]) {
+    if call_sites.is_empty() {
+        return;
+    }
+
+    output.push_str("USED BY:\n");
+    for call_site in call_sites {
+        for (depth, item) in call_site.caller.items.iter().enumerate() {
+            for line in item.declaration.lines() {
+                let _ = writeln!(output, "{}{line}", "  ".repeat(depth));
+            }
+        }
+        let _ = writeln!(
+            output,
+            "{}{}",
+            "  ".repeat(call_site.caller.items.len()),
+            call_site.call
+        );
     }
 }
 
@@ -685,7 +710,7 @@ fn estimate_tokens(text: &str) -> usize {
 mod tests {
     use std::path::PathBuf;
 
-    use crate::syntax::SyntaxSide;
+    use crate::syntax::{Language, SyntaxCallSite, SyntaxSide};
 
     use super::*;
 
@@ -700,6 +725,7 @@ mod tests {
         SyntaxSide {
             path: PathBuf::from(path),
             entries: vec![SyntaxEntry { items }],
+            call_sites: Vec::new(),
         }
     }
 
@@ -707,7 +733,7 @@ mod tests {
     fn identical_sides_render_once_as_shared_context() {
         let items = vec![item("impl ApiClient", 1), item("fn request(&self)", 2)];
         let context = SyntaxContext {
-            language: crate::syntax::Language::Rust,
+            language: Language::Rust,
             before: Some(side("src/client.rs", items.clone())),
             after: Some(side("src/client.rs", items)),
         };
@@ -721,7 +747,7 @@ mod tests {
     #[test]
     fn changed_structure_renders_before_and_after_separately() {
         let context = SyntaxContext {
-            language: crate::syntax::Language::Rust,
+            language: Language::Rust,
             before: Some(side("src/client.rs", vec![item("impl OldClient", 1)])),
             after: Some(side("src/client.rs", vec![item("impl Client", 1)])),
         };
@@ -733,14 +759,40 @@ mod tests {
     }
 
     #[test]
+    fn caller_context_is_rendered_after_changed_declarations() {
+        let context = SyntaxContext {
+            language: Language::Rust,
+            before: None,
+            after: Some(SyntaxSide {
+                path: PathBuf::from("src/terminal/progress.rs"),
+                entries: vec![SyntaxEntry {
+                    items: vec![item("fn thinking_preview_columns() -> usize", 1)],
+                }],
+                call_sites: vec![SyntaxCallSite {
+                    caller: SyntaxEntry {
+                        items: vec![item("impl ChatProgress", 1), item("fn new() -> Self", 2)],
+                    },
+                    call: "thinking_preview: ThinkingPreview::new(thinking_preview_columns()),"
+                        .to_owned(),
+                }],
+            }),
+        };
+
+        assert_eq!(
+            render_syntax_context(&context),
+            "### src/terminal/progress.rs\nlanguage: rust\n\nAFTER:\nfn thinking_preview_columns() -> usize\nUSED BY:\nimpl ChatProgress\n  fn new() -> Self\n    thinking_preview: ThinkingPreview::new(thinking_preview_columns()),"
+        );
+    }
+
+    #[test]
     fn global_budget_keeps_complete_contexts_in_commit_order() {
         let first = SyntaxContext {
-            language: crate::syntax::Language::Json,
+            language: Language::Json,
             before: None,
             after: Some(side("config.json", vec![item("\"timeout\":", 1)])),
         };
         let second = SyntaxContext {
-            language: crate::syntax::Language::Rust,
+            language: Language::Rust,
             before: None,
             after: Some(side("src/client.rs", vec![item("fn request()", 1)])),
         };
