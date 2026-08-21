@@ -1,20 +1,33 @@
 use std::path::Path;
 
-/// Programming languages supoorted for parsing via [`tree_sitter`].
+/// Programming languages supported by Tree-sitter parsing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Language {
+    /// Rust.
     Rust,
+    /// C.
     C,
+    /// C++.
     Cpp,
+    /// Python.
     Python,
+    /// Swift.
     Swift,
+    /// Bash or POSIX shell.
     Bash,
+    /// JavaScript.
     JavaScript,
+    /// TypeScript.
     TypeScript,
+    /// TypeScript JSX.
     Tsx,
+    /// CSS.
     Css,
+    /// HTML.
     Html,
+    /// TOML.
     Toml,
+    /// JSON.
     Json,
 }
 

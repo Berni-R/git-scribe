@@ -52,6 +52,7 @@ struct ChatRequest {
 }
 
 impl ChatRequest {
+    /// Build a request from chat options.
     pub fn new(
         model: impl Into<String>,
         messages: Vec<Message>,
@@ -241,6 +242,7 @@ impl Client {
     }
 }
 
+/// Accumulate newline-delimited streamed response chunks.
 fn collect_stream<R, F>(reader: R, mut on_event: F) -> Result<ChatResponse, OllamaError>
 where
     R: BufRead,

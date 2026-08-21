@@ -1,7 +1,9 @@
 /// An event-driven terminal spinner.
 #[derive(Debug)]
 pub struct Spinner {
+    /// Current frame index.
     frame: usize,
+    /// Available animation frames.
     frames: Vec<&'static str>,
 }
 
@@ -19,6 +21,7 @@ impl Spinner {
     /// A small orbital animation.
     pub const ORBIT: [&str; 4] = ["◜", "◝", "◞", "◟"];
 
+    /// Create a spinner from non-empty owned frame data.
     #[must_use]
     pub fn new(frames: Vec<&'static str>) -> Option<Self> {
         if frames.is_empty() {
@@ -28,11 +31,13 @@ impl Spinner {
         }
     }
 
+    /// Create a spinner from a frame slice.
     #[must_use]
     pub fn from_slice(frames: &[&'static str]) -> Option<Self> {
         Self::new(frames.to_vec())
     }
 
+    /// Return the current frame and advance cyclically.
     #[must_use]
     pub fn next_frame(&mut self) -> &'static str {
         let frame = self.frames[self.frame];

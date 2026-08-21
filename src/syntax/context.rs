@@ -10,29 +10,44 @@ use crate::{
 
 use super::Language;
 
+/// Maximum declarations retained for one file side.
 const MAX_ENTRIES_PER_SIDE: usize = 12;
+/// Maximum nested declarations retained for one entry.
 const MAX_ITEMS_PER_ENTRY: usize = 4;
+/// Maximum bytes retained for one declaration.
 const MAX_DECLARATION_BYTES: usize = 400;
 
 /// Language-independent role of source-derived syntax evidence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyntaxKind {
+    /// Module or namespace declaration.
     Module,
+    /// Type declaration.
     Type,
+    /// Implementation block.
     Impl,
+    /// Free function.
     Function,
+    /// Method declaration.
     Method,
+    /// Test declaration.
     Test,
+    /// Struct or class field.
     Field,
+    /// Constant declaration.
     Constant,
+    /// Import declaration.
     Import,
+    /// Control-flow header.
     ControlFlow,
+    /// Other useful syntax node.
     Other,
 }
 
 /// One useful source-derived construct associated with changed lines.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyntaxItem {
+    /// Semantic kind of the construct.
     pub kind: SyntaxKind,
 
     /// Faithful, compact source text for the selected construct without its body.
@@ -45,21 +60,27 @@ pub struct SyntaxItem {
 /// A chain of useful constructs from outer context to the most local changed construct.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyntaxEntry {
+    /// Nested constructs from outermost to innermost.
     pub items: Vec<SyntaxItem>,
 }
 
 /// Structural evidence for one available side of a changed file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyntaxSide {
+    /// File path for this side.
     pub path: PathBuf,
+    /// Extracted declaration chains.
     pub entries: Vec<SyntaxEntry>,
 }
 
 /// Structural evidence associated with the changed lines of one file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyntaxContext {
+    /// Detected source language.
     pub language: Language,
+    /// Context from the base version.
     pub before: Option<SyntaxSide>,
+    /// Context from the prospective version.
     pub after: Option<SyntaxSide>,
 }
 
@@ -107,8 +128,11 @@ pub fn context_for_change(repo: &GitRepo, change: &CommitChange) -> Result<Optio
 }
 
 struct SourceSide {
+    /// File version and path.
     version: FileVersion,
+    /// Blob contents.
     source: Vec<u8>,
+    /// Changed line ranges.
     ranges: Vec<LineRange>,
 }
 
@@ -136,10 +160,12 @@ fn load_side(
     }))
 }
 
+/// Detect the language for one source side.
 fn detect_side(side: &SourceSide) -> Option<Language> {
     Language::detect(&side.version.path, &side.source)
 }
 
+/// Analyze one source side into declaration context.
 fn analyze_side(side: SourceSide, language: Language) -> Result<SyntaxSide> {
     Ok(SyntaxSide {
         path: side.version.path,
@@ -188,12 +214,14 @@ pub fn context_for_ranges(
     Ok(entries)
 }
 
+/// Convert a line range to bounded zero-based rows.
 fn changed_rows(range: LineRange, line_count: usize) -> impl Iterator<Item = usize> {
     let start = range.start.saturating_sub(1).min(line_count);
     let end = start.saturating_add(range.count).min(line_count);
     start..end
 }
 
+/// Find the smallest named syntax node at a changed row.
 fn focus_on_row<'tree>(root: Node<'tree>, lines: &[&[u8]], row: usize) -> Option<Node<'tree>> {
     let line = *lines.get(row)?;
     let column = line
@@ -205,6 +233,7 @@ fn focus_on_row<'tree>(root: Node<'tree>, lines: &[&[u8]], row: usize) -> Option
     root.named_descendant_for_point_range(point, point)
 }
 
+/// Build the enclosing declaration chain for one changed node.
 fn syntax_entry(
     source: &[u8],
     focus: Node<'_>,
@@ -231,6 +260,7 @@ fn syntax_entry(
     (key, SyntaxEntry { items })
 }
 
+/// Check whether a changed row belongs to a control-flow header.
 fn control_header_contains(node: Node<'_>, changed_row: usize) -> bool {
     let header_end = ["body", "consequence"]
         .into_iter()
@@ -240,6 +270,7 @@ fn control_header_contains(node: Node<'_>, changed_row: usize) -> bool {
     (node.start_position().row..=header_end).contains(&changed_row)
 }
 
+/// Convert a syntax node into a compact semantic item.
 fn syntax_item(source: &[u8], node: Node<'_>, language: Language) -> Option<SyntaxItem> {
     let (start, start_line) = declaration_start(node, language);
     let end = declaration_end(node, language);
@@ -253,6 +284,7 @@ fn syntax_item(source: &[u8], node: Node<'_>, language: Language) -> Option<Synt
     })
 }
 
+/// Map a Tree-sitter node to an application-level syntax kind.
 #[allow(clippy::too_many_lines)] // One declarative mapping keeps grammar knowledge in one place.
 fn syntax_kind(node: Node<'_>, language: Language, declaration: &str) -> Option<SyntaxKind> {
     let kind = match (language, node.kind()) {
@@ -390,6 +422,7 @@ fn syntax_kind(node: Node<'_>, language: Language, declaration: &str) -> Option<
     Some(kind)
 }
 
+/// Check whether a node is nested inside a method declaration.
 fn has_method_parent(node: Node<'_>) -> bool {
     let mut parent = node.parent();
     while let Some(node) = parent {
@@ -410,6 +443,7 @@ fn has_method_parent(node: Node<'_>) -> bool {
     false
 }
 
+/// Check whether a Rust declaration has a test attribute.
 fn is_rust_test(declaration: &str) -> bool {
     declaration.lines().any(|line| {
         let attribute = line.trim();
@@ -421,6 +455,7 @@ fn is_rust_test(declaration: &str) -> bool {
     })
 }
 
+/// Find the end of a compact declaration.
 fn declaration_end(node: Node<'_>, language: Language) -> usize {
     if let Some(content) = ["body", "consequence", "value"]
         .into_iter()
@@ -454,6 +489,7 @@ fn declaration_end(node: Node<'_>, language: Language) -> usize {
     node.end_byte()
 }
 
+/// Find the start byte and one-based line of a declaration.
 fn declaration_start(mut node: Node<'_>, language: Language) -> (usize, usize) {
     if language == Language::Rust {
         while let Some(attribute) = node
@@ -467,6 +503,7 @@ fn declaration_start(mut node: Node<'_>, language: Language) -> (usize, usize) {
     (node.start_byte(), node.start_position().row + 1)
 }
 
+/// Trim and bound source text for prompt context.
 fn compact_source(source: &[u8]) -> Option<String> {
     let source = String::from_utf8_lossy(source);
     let declaration = source.trim().trim_end_matches('{').trim();

@@ -8,7 +8,9 @@ use crate::segments;
 
 use super::{Segment, Spinner, Terminal, TextStyle};
 
+/// Maximum reasoning lines shown in the live preview.
 const THINKING_PREVIEW_LINES: usize = 5;
+/// Fallback preview width when terminal width is unavailable.
 const THINKING_PREVIEW_FALLBACK_COLUMNS: usize = 72;
 
 /// Renders the lifecycle of a streamed model response on a [`Terminal`].
@@ -16,13 +18,21 @@ const THINKING_PREVIEW_FALLBACK_COLUMNS: usize = 72;
 /// This owns display-specific streaming state, leaving callers to submit the
 /// request and handle the completed response.
 pub struct ChatProgress {
+    /// Terminal renderer.
     terminal: Terminal,
+    /// Whether reasoning text is visible.
     show_thinking: bool,
+    /// Spinner animation state.
     spinner: Spinner,
+    /// Time the prompt was sent.
     prompt_sent_at: Instant,
+    /// Start of reasoning, if any.
     thinking_started_at: Option<Instant>,
+    /// Start of generation, if any.
     generating_started_at: Option<Instant>,
+    /// Bounded reasoning preview.
     thinking_preview: ThinkingPreview,
+    /// Number of currently rendered reasoning lines.
     rendered_thinking_lines: usize,
 }
 
@@ -76,6 +86,7 @@ impl ChatProgress {
         }
     }
 
+    /// Render the response-started transition.
     fn response_started(&self) {
         self.terminal.complete([Segment::text(
             TextStyle::Neutral,
@@ -86,6 +97,7 @@ impl ChatProgress {
         )]);
     }
 
+    /// Render a reasoning fragment.
     fn thinking(&mut self, thinking: &str) {
         let first = self.thinking_started_at.is_none();
         let started_at = *self.thinking_started_at.get_or_insert_with(Instant::now);
@@ -112,6 +124,7 @@ impl ChatProgress {
         }
     }
 
+    /// Render the generation transition and spinner.
     fn generating(&mut self) {
         if self.generating_started_at.is_none()
             && let Some(thinking_started_at) = self.thinking_started_at
@@ -133,6 +146,7 @@ impl ChatProgress {
         );
     }
 
+    /// Complete the reasoning phase.
     fn finish_thinking(&mut self, label: &str, started_at: Instant) {
         let elapsed = format_elapsed(started_at.elapsed());
         if self.show_thinking {
@@ -154,6 +168,7 @@ impl ChatProgress {
     }
 }
 
+/// Format elapsed time as seconds or minutes and seconds.
 fn format_elapsed(duration: Duration) -> String {
     let seconds = duration
         .as_secs()
@@ -169,12 +184,16 @@ fn format_elapsed(duration: Duration) -> String {
 }
 
 struct ThinkingPreview {
+    /// Maximum display width.
     column_limit: usize,
+    /// Completed preview lines.
     completed_lines: Vec<String>,
+    /// Current unfinished line.
     current_line: String,
 }
 
 impl ThinkingPreview {
+    /// Create an empty preview with a column limit.
     const fn new(column_limit: usize) -> Self {
         Self {
             column_limit,
@@ -183,6 +202,7 @@ impl ThinkingPreview {
         }
     }
 
+    /// Add streamed text and return visible lines.
     fn push(&mut self, fragment: &str) -> Vec<String> {
         for character in fragment.chars() {
             match character {
@@ -199,6 +219,7 @@ impl ThinkingPreview {
         self.visible_lines()
     }
 
+    /// Flush the current line and return visible lines.
     fn finish(&mut self) -> Vec<String> {
         if !self.current_line.is_empty() {
             self.complete_current_line();
@@ -206,6 +227,7 @@ impl ThinkingPreview {
         self.visible_lines()
     }
 
+    /// Move the current line into the bounded history.
     fn complete_current_line(&mut self) {
         self.completed_lines
             .push(std::mem::take(&mut self.current_line));
@@ -214,6 +236,7 @@ impl ThinkingPreview {
         }
     }
 
+    /// Return only the most recent visible lines.
     fn visible_lines(&self) -> Vec<String> {
         let mut lines = self.completed_lines.clone();
         if !self.current_line.is_empty() {
@@ -225,6 +248,7 @@ impl ThinkingPreview {
     }
 }
 
+/// Determine preview width from the terminal environment.
 fn thinking_preview_columns() -> usize {
     const TIMESTAMP_COLUMNS: usize = 11; // `[HH:MM:SS] `
     const MINIMUM_COLUMNS: usize = 20;

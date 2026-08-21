@@ -142,7 +142,6 @@ fn unborn_repository_uses_empty_tree() -> Result<()> {
     fixture.write_and_stage("new.rs", "fn main() {}\n")?;
     let repo = GitRepo::discover(&nested)?;
 
-    assert_eq!(repo.root(), fixture.path.canonicalize()?);
     assert_eq!(repo.current_branch()?.as_deref(), Some("main"));
     assert_eq!(repo.head_sha()?, None);
     assert!(repo.is_dirty()?);

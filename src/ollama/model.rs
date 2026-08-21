@@ -12,7 +12,7 @@ use crate::ollama::{
 pub struct Model {
     /// The model's name.
     pub model: String,
-    // URL of the upstream Ollama host, if the model is remote.
+    /// URL of the upstream Ollama host, if the model is remote.
     remote_host: Option<String>,
     /// Total size of the model on disk in bytes.
     pub size: u64,
@@ -28,6 +28,7 @@ impl Model {
 
 #[derive(Debug, Deserialize)]
 struct ListModelsResponse {
+    /// Available models.
     models: Vec<Model>,
 }
 
@@ -48,6 +49,7 @@ pub struct RunningModel {
 
 #[derive(Debug, Deserialize)]
 struct ListRunningModelsResponse {
+    /// Currently loaded models.
     models: Vec<RunningModel>,
 }
 

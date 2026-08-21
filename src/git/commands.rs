@@ -92,7 +92,7 @@ impl GitRepo {
     /// The Git command remains responsible for editing, hooks, signing, and creating the commit.
     pub fn commit_interactively(&self, mode: CommitMode, message: &str) -> Result<()> {
         let mut command = Command::new("git");
-        command.current_dir(self.root()).arg("commit");
+        command.current_dir(self.workdir()?).arg("commit");
         if mode == CommitMode::Amend {
             command.arg("--amend");
         }
@@ -168,12 +168,13 @@ impl GitRepo {
         Ok(files)
     }
 
+    /// Recursively collect non-ignored working-tree files.
     fn collect_working_tree_files(
         &self,
         relative_directory: &Path,
         files: &mut Vec<PathBuf>,
     ) -> Result<()> {
-        let directory = self.root().join(relative_directory);
+        let directory = self.workdir()?.join(relative_directory);
         let mut entries = fs::read_dir(&directory)
             .with_context(|| {
                 format!(
@@ -220,6 +221,7 @@ impl GitRepo {
         Ok(())
     }
 
+    /// Build the rename-aware tree-to-index diff for a commit mode.
     fn prospective_diff(&self, mode: CommitMode) -> Result<Diff<'_>> {
         let base = self.base_tree(mode)?;
         let index = self
@@ -248,6 +250,7 @@ impl GitRepo {
     }
 }
 
+/// Convert all diff deltas into owned commit changes.
 fn commit_changes(diff: &Diff<'_>) -> Result<Vec<CommitChange>> {
     diff.deltas()
         .enumerate()
@@ -255,6 +258,7 @@ fn commit_changes(diff: &Diff<'_>) -> Result<Vec<CommitChange>> {
         .collect()
 }
 
+/// Convert one diff delta into an owned commit change.
 fn commit_change(diff: &Diff<'_>, index: usize, delta: &DiffDelta<'_>) -> Result<CommitChange> {
     let status = delta.status();
     let kind = match status {
@@ -284,8 +288,12 @@ fn commit_change(diff: &Diff<'_>, index: usize, delta: &DiffDelta<'_>) -> Result
                 .context("libgit2 omitted the path for an unmerged change")?
                 .to_path_buf(),
         },
-        unsupported => {
-            bail!("libgit2 returned unsupported prospective commit status: {unsupported:?}")
+        status @ (Delta::Unmodified
+        | Delta::Copied
+        | Delta::Ignored
+        | Delta::Untracked
+        | Delta::Unreadable) => {
+            bail!("libgit2 returned unsupported prospective commit status: {status:?}")
         }
     };
 
@@ -297,6 +305,7 @@ fn commit_change(diff: &Diff<'_>, index: usize, delta: &DiffDelta<'_>) -> Result
     Ok(CommitChange { kind, hunks })
 }
 
+/// Convert a libgit2 file entry into a validated file version.
 fn file_version(file: &DiffFile<'_>, description: &str) -> Result<FileVersion> {
     if !file.exists() {
         bail!("libgit2 reported a missing {description}");
@@ -320,6 +329,7 @@ fn file_version(file: &DiffFile<'_>, description: &str) -> Result<FileVersion> {
     })
 }
 
+/// Extract line ranges from one diff patch.
 fn patch_hunks(diff: &Diff<'_>, index: usize) -> Result<Vec<DiffHunk>> {
     let Some(patch) =
         Patch::from_diff(diff, index).context("failed to read a prospective commit patch")?
@@ -340,6 +350,7 @@ fn patch_hunks(diff: &Diff<'_>, index: usize) -> Result<Vec<DiffHunk>> {
         .collect()
 }
 
+/// Convert a non-empty libgit2 line range to the public representation.
 fn line_range(start: u32, count: u32) -> Option<LineRange> {
     (count != 0).then(|| LineRange {
         start: usize::try_from(start).expect("u32 fits in usize"),
@@ -347,6 +358,7 @@ fn line_range(start: u32, count: u32) -> Option<LineRange> {
     })
 }
 
+/// Render a diff as a zero-context patch.
 fn render_patch(diff: &Diff<'_>) -> Result<Vec<u8>> {
     let mut output = Vec::new();
     diff.print(DiffFormat::Patch, |_, _, line| {

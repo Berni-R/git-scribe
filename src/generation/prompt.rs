@@ -27,7 +27,10 @@ pub struct Prompt {
     pub estimated_tokens: usize,
 }
 
+/// Marker appended when supporting context is clipped.
 const CLIP_SUFFIX: &str = "\n...[clipped for context budget]...";
+
+/// Placeholder used while measuring a prompt without README content.
 const README_OMITTED: &str = "(README omitted)";
 
 /// Number of recent commit subjects included as evidence for repository-specific commit-message style.
@@ -132,9 +135,8 @@ that is fully supported.
         if fixed > token_budget {
             bail!(
                 "commit it too large for the model context: \
-                 selected diff + required metadata are ~{fixed} tokens; \
-                 prompt budget is {token_budget}. \
-                 Split the commit or increase the context size."
+                 selected diff + required metadata are ~{fixed} tokens; budget is {token_budget}.\n\
+                 Split the commit, increase the context size, or use `--exclude-diff`."
             );
         }
 
@@ -232,14 +234,23 @@ that is fully supported.
 
 #[derive(Clone, Copy)]
 struct PromptParts<'a> {
+    /// Current branch name.
     branch: &'a str,
+    /// Visible working-tree paths.
     working_tree: &'a str,
+    /// Recent commit subjects.
     history: &'a str,
+    /// Changed-file summaries.
     commit_files: &'a str,
+    /// Aggregate commit statistics.
     commit_stats: &'a str,
+    /// Optional syntax context for changed files.
     syntax_context: Option<&'a [SyntaxContext]>,
+    /// Root README content.
     readme: &'a str,
+    /// Additional author-provided context.
     author_context: &'a [String],
+    /// Concrete commit diff.
     diff: &'a str,
 }
 
@@ -310,6 +321,7 @@ Git-ignored entries are omitted. Paths describe repository structure, not commit
     )
 }
 
+/// Collect syntax context for non-excluded changed files.
 fn syntax_contexts(
     repo: &GitRepo,
     changes: &[CommitChange],
@@ -357,6 +369,7 @@ fn filtered_diff(commit: &ProspectiveCommit, excluded_paths: &[PathBuf]) -> Resu
     Ok(String::from_utf8_lossy(&output).into_owned())
 }
 
+/// Split a patch into its per-file diff blocks.
 fn patch_blocks(patch: &[u8]) -> Vec<&[u8]> {
     let starts = patch
         .windows(b"diff --git ".len())
@@ -373,6 +386,7 @@ fn patch_blocks(patch: &[u8]) -> Vec<&[u8]> {
         .collect()
 }
 
+/// Check whether a change touches an excluded path.
 fn is_excluded(change: &CommitChange, excluded_paths: &[PathBuf]) -> bool {
     // TODO: specify to exclude just the before or after?
     [change.before(), change.after()]
@@ -401,6 +415,7 @@ fn select_syntax_contexts(contexts: Vec<SyntaxContext>, budget: usize) -> Vec<Sy
     selected
 }
 
+/// Render an optional syntax-context section.
 fn syntax_context_section(contexts: Option<&[SyntaxContext]>) -> String {
     let Some(contexts) = contexts.filter(|contexts| !contexts.is_empty()) else {
         return String::new();
@@ -413,6 +428,7 @@ fn syntax_context_section(contexts: Option<&[SyntaxContext]>) -> String {
     syntax_context_section_text(&rendered)
 }
 
+/// Wrap rendered syntax context in its prompt section.
 fn syntax_context_section_text(rendered: &str) -> String {
     format!(
         r"
@@ -425,6 +441,7 @@ Changed-line structure. BEFORE = base; AFTER = prospective commit.
     )
 }
 
+/// Render one file's before-and-after syntax context.
 fn render_syntax_context(context: &SyntaxContext) -> String {
     let path = match (&context.before, &context.after) {
         (Some(before), Some(after)) if before.path != after.path => {
@@ -464,6 +481,7 @@ fn render_syntax_context(context: &SyntaxContext) -> String {
     rendered.trim_end().to_owned()
 }
 
+/// Check whether two syntax-entry lists have the same declarations and kinds.
 fn same_entries(before: &[SyntaxEntry], after: &[SyntaxEntry]) -> bool {
     before.len() == after.len()
         && before.iter().zip(after).all(|(before, after)| {
@@ -478,6 +496,7 @@ fn same_entries(before: &[SyntaxEntry], after: &[SyntaxEntry]) -> bool {
         })
 }
 
+/// Append syntax entries while suppressing repeated parent declarations.
 fn render_entries(output: &mut String, entries: &[SyntaxEntry]) {
     let mut previous: &[SyntaxItem] = &[];
     for entry in entries {
@@ -508,6 +527,7 @@ fn working_tree_text(repo: &GitRepo) -> Result<String> {
     Ok(output)
 }
 
+/// Render paths as an indented directory hierarchy.
 fn render_working_tree(files: &[PathBuf]) -> String {
     if files.is_empty() {
         return "(working tree is empty)".to_owned();
@@ -543,6 +563,7 @@ fn render_working_tree(files: &[PathBuf]) -> String {
     output.trim_end().to_owned()
 }
 
+/// Render a path component while escaping line breaks.
 fn display_path_component(component: &OsStr) -> String {
     component
         .to_string_lossy()
@@ -550,7 +571,7 @@ fn display_path_component(component: &OsStr) -> String {
         .replace('\r', "\\r")
 }
 
-/// Name the current branch or detached HEAD mode.
+/// Return the current branch or a detached-HEAD marker.
 fn branch_text(repo: &GitRepo) -> Result<String> {
     match repo.current_branch()? {
         Some(branch) => Ok(branch),
@@ -574,7 +595,7 @@ fn commit_history_text(repo: &GitRepo, mode: CommitMode) -> Result<String> {
     }
 }
 
-/// Return newline-separated summaries of the files changed by the commit.
+/// Render changed-file summaries as newline-separated text.
 fn file_change_status_text(changes: &[CommitChange]) -> String {
     changes
         .iter()

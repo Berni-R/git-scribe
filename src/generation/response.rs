@@ -4,11 +4,11 @@ use serde_json::{Value, json};
 
 #[derive(Debug, Deserialize)]
 pub struct CommitMessage {
-    /// Coherent purpose or project-level effect of the staged changes.
-    pub intent: String,
-
     /// Important concrete changes that support the inferred intent.
     pub key_changes: Vec<String>,
+
+    /// Coherent purpose or project-level effect of the staged changes.
+    pub intent: String,
 
     /// Nature of the change as a whole.
     pub change_kind: ChangeKind,
@@ -110,12 +110,6 @@ impl CommitMessage {
         json!({
             "type": "object",
             "properties": {
-                "intent": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 240,
-                    "description": "The coherent purpose or project-level effect of the staged changes as a whole."
-                },
                 "key_changes": {
                     "type": "array",
                     "minItems": 1,
@@ -126,6 +120,12 @@ impl CommitMessage {
                         "maxLength": 180,
                     },
                     "description": "The most important concrete changes that support the inferred intent. Focus on distinct, relevant changes rather than restating the diff."
+                },
+                "intent": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 240,
+                    "description": "The coherent purpose or project-level effect of the staged changes as a whole."
                 },
                 "change_kind": {
                     "type": "string",

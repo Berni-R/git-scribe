@@ -47,7 +47,7 @@ pub struct ModelOptions {
 
 /// Controls whether and how a model exposes its reasoning output.
 ///
-/// Ollama accepts either a boolean or, for models supporting configurable reasoning effort, a [`ThinkLevel`].
+/// Ollama accepts either a boolean or a configurable reasoning level.
 #[derive(Debug, Default, Clone, Copy, clap::ValueEnum, PartialEq, Eq)]
 pub enum Think {
     /// Turn thinking off by passing `false` to Ollama.

@@ -1,25 +1,16 @@
-use std::{
-    fmt,
-    path::{Path, PathBuf},
-};
+use std::{fmt, path::Path};
 
 use anyhow::{Context as _, Result, bail};
 use git2::{Commit, ErrorCode, Repository, Tree};
 
-/// A Git working-tree repository.
-///
-/// The repository remains open through libgit2 and records its canonical, absolute working-tree root.
-/// Bare repositories are not supported.
-pub struct GitRepo {
-    repository: Repository,
-    root: PathBuf,
-}
+/// A non-bare Git repository backed by `libgit2`.
+pub struct GitRepo(Repository);
 
 impl fmt::Debug for GitRepo {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("GitRepo")
-            .field("root", &self.root)
+            .field("path", &self.0.path())
             .finish_non_exhaustive()
     }
 }
@@ -48,33 +39,29 @@ impl GitRepo {
                 directory.display()
             )
         })?;
-        let workdir = repository.workdir().with_context(|| {
+        repository.workdir().with_context(|| {
             format!("Git repository at {} is bare", repository.path().display())
         })?;
-        let root = workdir.canonicalize().with_context(|| {
-            format!(
-                "failed to resolve Git working tree at {}",
-                workdir.display()
-            )
-        })?;
 
-        Ok(Self { repository, root })
+        Ok(Self(repository))
     }
 
-    /// Return the canonical, absolute path to the working-tree root.
+    /// Return the underlying `libgit2` repository for use within the Git abstraction.
     #[must_use]
-    pub fn root(&self) -> &Path {
-        &self.root
+    pub(super) fn repository(&self) -> &Repository {
+        &self.0
     }
 
-    /// Return the underlying libgit2 repository for use within the Git abstraction.
-    pub(super) fn repository(&self) -> &Repository {
-        &self.repository
+    /// Return the repository working tree, rejecting bare repositories.
+    pub(super) fn workdir(&self) -> Result<&Path> {
+        self.0
+            .workdir()
+            .with_context(|| format!("Git repository at {} is bare", self.0.path().display()))
     }
 
     /// Resolve HEAD to a commit, or return None for an unborn branch.
     pub(super) fn head_commit(&self) -> Result<Option<Commit<'_>>> {
-        let head = match self.repository.head() {
+        let head = match self.0.head() {
             Ok(head) => head,
             Err(error) if error.code() == ErrorCode::UnbornBranch => return Ok(None),
             Err(error) => return Err(error).context("failed to read Git HEAD"),

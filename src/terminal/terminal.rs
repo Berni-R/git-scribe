@@ -26,22 +26,30 @@ pub enum TextStyle {
 
 /// A styled text fragment or a spinner frame within a diagnostic line.
 pub enum Segment<'a> {
+    /// Styled formatted text.
     Text {
+        /// Text style.
         style: TextStyle,
+        /// Deferred formatted content.
         content: fmt::Arguments<'a>,
     },
+    /// Styled spinner frame.
     Spinner {
+        /// Frame style.
         style: TextStyle,
+        /// Frame text.
         frame: &'a str,
     },
 }
 
 impl<'a> Segment<'a> {
+    /// Construct a styled text segment.
     #[must_use]
     pub const fn text(style: TextStyle, content: fmt::Arguments<'a>) -> Self {
         Self::Text { style, content }
     }
 
+    /// Construct a styled spinner segment.
     #[must_use]
     pub const fn spinner(style: TextStyle, frame: &'a str) -> Self {
         Self::Spinner { style, frame }
@@ -52,22 +60,33 @@ impl<'a> Segment<'a> {
 #[derive(Debug, Clone, Copy)]
 #[allow(clippy::struct_excessive_bools)] // These flags represent independent terminal capabilities.
 pub struct Terminal {
+    /// Whether ANSI colors are enabled.
     color: bool,
+    /// Whether stderr is interactive.
     interactive: bool,
+    /// Whether progress output is enabled.
     progress: bool,
+    /// Whether timestamps are shown.
     timestamp: bool,
 }
 
 impl Terminal {
+    /// ANSI reset sequence.
     const CLEAR: &str = "\x1b[0m";
     // Include foreground 39 explicitly. While SGR 0 nominally restores it, spelling out the
     // default foreground makes neutral segments independent of an immediately adjacent color.
     const NEUTRAL: &str = "\x1b[2;39m";
+    /// ANSI bold-neutral sequence.
     const BOLD_NEUTRAL: &str = "\x1b[1;2;39m";
+    /// ANSI green sequence.
     const GREEN: &str = "\x1b[2;32m";
+    /// ANSI red sequence.
     const RED: &str = "\x1b[2;31m";
+    /// ANSI thinking sequence.
     const THINKING: &str = "\x1b[2;38;5;103m";
+    /// ANSI orange sequence.
     const ORANGE: &str = "\x1b[38;5;208m";
+    /// ANSI error sequence.
     const ERROR: &str = "\x1b[31m";
 
     /// Create terminal output, optionally decorated with ANSI colors and timestamps.
@@ -168,6 +187,7 @@ impl Terminal {
         let _ = stderr.flush();
     }
 
+    /// Render the current thinking preview and clear stale rows.
     fn write_thinking_lines<W: io::Write>(
         self,
         output: &mut W,
@@ -231,6 +251,7 @@ impl Terminal {
         format!("{}{}", "█".repeat(filled), "░".repeat(width - filled))
     }
 
+    /// Render a line, optionally replacing the previous line.
     fn write_line<'a>(
         self,
         replace_previous: bool,
@@ -248,6 +269,7 @@ impl Terminal {
         let _ = stderr.flush();
     }
 
+    /// Render timestamp and segments to an output stream.
     fn write_rendered_line<'a, W: io::Write>(
         self,
         output: &mut W,
@@ -258,6 +280,7 @@ impl Terminal {
         let _ = writeln!(output);
     }
 
+    /// Render styled segments to an output stream.
     fn write_segments<'a, W: io::Write>(
         self,
         output: &mut W,
@@ -279,22 +302,26 @@ impl Terminal {
         }
     }
 
+    /// Check whether a spinner should be emitted.
     const fn should_write_spinner(self, first: bool) -> bool {
         self.interactive || first
     }
 
+    /// Apply an ANSI style when colors are enabled.
     fn apply_style<W: io::Write>(self, output: &mut W, style: TextStyle) {
         if self.color {
             let _ = write!(output, "{}{}", Self::CLEAR, Self::style_code(style));
         }
     }
 
+    /// Reset ANSI styling when colors are enabled.
     fn reset_style<W: io::Write>(self, output: &mut W) {
         if self.color {
             let _ = write!(output, "{}", Self::CLEAR);
         }
     }
 
+    /// Return the ANSI code for a text style.
     fn style_code(style: TextStyle) -> &'static str {
         match style {
             TextStyle::Neutral => Self::NEUTRAL,
@@ -307,6 +334,7 @@ impl Terminal {
         }
     }
 
+    /// Write the optional local timestamp.
     fn write_timestamp<W: io::Write>(self, output: &mut W) {
         if self.timestamp {
             self.apply_style(output, TextStyle::Neutral);
@@ -316,6 +344,7 @@ impl Terminal {
     }
 }
 
+/// Return the current local time as `HH:MM:SS`.
 fn timestamp() -> String {
     OffsetDateTime::now_local()
         .unwrap_or_else(|_| OffsetDateTime::now_utc())
