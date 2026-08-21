@@ -1,10 +1,8 @@
-use std::{
-    env,
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 
 use crate::ollama::{ChatEvent, ChatResponse};
 use crate::segments;
+use terminal_size::{Width, terminal_size};
 
 use super::{Segment, Spinner, Terminal, TextStyle};
 
@@ -248,14 +246,13 @@ impl ThinkingPreview {
     }
 }
 
-/// Determine preview width from the terminal environment.
+/// Determine preview width from the connected terminal.
 fn thinking_preview_columns() -> usize {
     const TIMESTAMP_COLUMNS: usize = 11; // `[HH:MM:SS] `
     const MINIMUM_COLUMNS: usize = 20;
 
-    env::var("COLUMNS")
-        .ok()
-        .and_then(|columns| columns.parse::<usize>().ok())
+    terminal_size()
+        .map(|(Width(columns), _)| usize::from(columns))
         .filter(|&columns| columns >= MINIMUM_COLUMNS)
         .map_or(THINKING_PREVIEW_FALLBACK_COLUMNS, |columns| {
             columns.saturating_sub(TIMESTAMP_COLUMNS).max(1)

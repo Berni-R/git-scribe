@@ -15,6 +15,7 @@ reqwest = { version = "0.13", default-features = false, features = [
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"
+terminal_size = "0.4"
 time = { version = "0.3", features = ["formatting", "local-offset", "macros"] }
 tree-sitter = "0.26"
 tree-sitter-bash = "0.25"
