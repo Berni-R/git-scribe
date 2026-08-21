@@ -173,8 +173,8 @@ impl CommitMessage {
                 }
             },
             "required": [
-                "intent",
                 "key_changes",
+                "intent",
                 "change_kind",
                 "confidence",
                 "subject",

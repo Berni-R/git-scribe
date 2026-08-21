@@ -17,39 +17,9 @@ const MAX_ITEMS_PER_ENTRY: usize = 4;
 /// Maximum bytes retained for one declaration.
 const MAX_DECLARATION_BYTES: usize = 400;
 
-/// Language-independent role of source-derived syntax evidence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SyntaxKind {
-    /// Module or namespace declaration.
-    Module,
-    /// Type declaration.
-    Type,
-    /// Implementation block.
-    Impl,
-    /// Free function.
-    Function,
-    /// Method declaration.
-    Method,
-    /// Test declaration.
-    Test,
-    /// Struct or class field.
-    Field,
-    /// Constant declaration.
-    Constant,
-    /// Import declaration.
-    Import,
-    /// Control-flow header.
-    ControlFlow,
-    /// Other useful syntax node.
-    Other,
-}
-
 /// One useful source-derived construct associated with changed lines.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyntaxItem {
-    /// Semantic kind of the construct.
-    pub kind: SyntaxKind,
-
     /// Faithful, compact source text for the selected construct without its body.
     pub declaration: String,
 
@@ -244,7 +214,7 @@ fn syntax_entry(
     let mut current = Some(focus);
     while let Some(node) = current {
         if let Some(item) = syntax_item(source, node, language)
-            && (item.kind != SyntaxKind::ControlFlow || control_header_contains(node, changed_row))
+            && (!is_control_flow(node) || control_header_contains(node, changed_row))
         {
             items.push((node.start_byte(), node.end_byte(), item));
         }
@@ -272,187 +242,66 @@ fn control_header_contains(node: Node<'_>, changed_row: usize) -> bool {
 
 /// Convert a syntax node into a compact semantic item.
 fn syntax_item(source: &[u8], node: Node<'_>, language: Language) -> Option<SyntaxItem> {
+    if !is_context_node(node, language) {
+        return None;
+    }
+
     let (start, start_line) = declaration_start(node, language);
     let end = declaration_end(node, language);
     let declaration = compact_source(source.get(start..end)?)?;
-    let kind = syntax_kind(node, language, &declaration)?;
 
     Some(SyntaxItem {
-        kind,
         declaration,
         start_line,
     })
 }
 
-/// Map a Tree-sitter node to an application-level syntax kind.
-#[allow(clippy::too_many_lines)] // One declarative mapping keeps grammar knowledge in one place.
-fn syntax_kind(node: Node<'_>, language: Language, declaration: &str) -> Option<SyntaxKind> {
-    let kind = match (language, node.kind()) {
-        (Language::Rust, "mod_item")
-        | (Language::Cpp, "namespace_definition")
-        | (Language::TypeScript | Language::Tsx, "internal_module")
-        | (Language::Toml, "table" | "table_array_element") => SyntaxKind::Module,
-
-        (
-            Language::Rust,
-            "struct_item" | "enum_item" | "union_item" | "trait_item" | "type_item",
+/// Check whether a node provides useful enclosing source context.
+fn is_context_node(node: Node<'_>, language: Language) -> bool {
+    ["body", "consequence", "name"]
+        .into_iter()
+        .any(|field| node.child_by_field_name(field).is_some())
+        || node.kind().contains("import")
+        || node.kind().contains("include")
+        || matches!(
+            (language, node.kind()),
+            (Language::Rust, "use_declaration")
+                | (
+                    Language::Toml | Language::Json,
+                    "pair" | "table" | "table_array_element"
+                )
+                | (
+                    Language::Css,
+                    "rule_set"
+                        | "media_statement"
+                        | "supports_statement"
+                        | "scope_statement"
+                        | "keyframes_statement"
+                )
+                | (
+                    Language::Html,
+                    "element" | "script_element" | "style_element"
+                )
         )
-        | (
-            Language::C | Language::Cpp,
-            "struct_specifier" | "union_specifier" | "enum_specifier",
-        )
-        | (Language::Cpp, "class_specifier")
-        | (Language::Python, "class_definition")
-        | (
-            Language::Swift,
-            "class_declaration"
-            | "struct_declaration"
-            | "enum_declaration"
-            | "protocol_declaration",
-        )
-        | (Language::JavaScript, "class_declaration")
-        | (
-            Language::TypeScript | Language::Tsx,
-            "class_declaration"
-            | "abstract_class_declaration"
-            | "interface_declaration"
-            | "type_alias_declaration"
-            | "enum_declaration",
-        ) => SyntaxKind::Type,
-
-        (Language::Rust, "impl_item") | (Language::Swift, "extension_declaration") => {
-            SyntaxKind::Impl
-        }
-
-        (Language::Rust, "field_declaration")
-        | (Language::Swift, "property_declaration")
-        | (Language::Toml | Language::Json, "pair") => SyntaxKind::Field,
-
-        (Language::Rust, "const_item" | "static_item") => SyntaxKind::Constant,
-
-        (Language::Rust, "use_declaration")
-        | (Language::C | Language::Cpp, "preproc_include")
-        | (Language::Python, "import_statement" | "import_from_statement")
-        | (Language::Swift, "import_declaration")
-        | (Language::JavaScript | Language::TypeScript | Language::Tsx, "import_statement") => {
-            SyntaxKind::Import
-        }
-
-        (Language::Rust, "function_item" | "function_signature_item")
-            if is_rust_test(declaration) =>
-        {
-            SyntaxKind::Test
-        }
-
-        (Language::Swift, "initializer_declaration" | "subscript_declaration")
-        | (Language::JavaScript | Language::TypeScript | Language::Tsx, "method_definition")
-        | (Language::TypeScript | Language::Tsx, "method_signature") => SyntaxKind::Method,
-
-        (Language::Rust, "function_item" | "function_signature_item")
-        | (
-            Language::C | Language::Cpp | Language::Python | Language::Bash,
-            "function_definition",
-        )
-        | (Language::Swift, "function_declaration")
-        | (
-            Language::JavaScript | Language::TypeScript | Language::Tsx,
-            "function_declaration"
-            | "generator_function_declaration"
-            | "function_expression"
-            | "generator_function"
-            | "arrow_function",
-        ) if has_method_parent(node) => SyntaxKind::Method,
-
-        (Language::Rust, "function_item" | "function_signature_item")
-        | (
-            Language::C | Language::Cpp | Language::Python | Language::Bash,
-            "function_definition",
-        )
-        | (Language::Swift, "function_declaration")
-        | (
-            Language::JavaScript | Language::TypeScript | Language::Tsx,
-            "function_declaration"
-            | "generator_function_declaration"
-            | "function_expression"
-            | "generator_function"
-            | "arrow_function",
-        ) => SyntaxKind::Function,
-
-        (
-            Language::Rust,
-            "if_expression" | "match_expression" | "for_expression" | "while_expression"
-            | "loop_expression",
-        )
-        | (
-            Language::C
-            | Language::Cpp
-            | Language::Swift
-            | Language::JavaScript
-            | Language::TypeScript
-            | Language::Tsx,
-            "if_statement" | "for_statement" | "while_statement" | "switch_statement",
-        )
-        | (
-            Language::Python,
-            "if_statement" | "for_statement" | "while_statement" | "with_statement"
-            | "match_statement",
-        )
-        | (
-            Language::Bash,
-            "if_statement" | "for_statement" | "while_statement" | "case_statement",
-        ) => SyntaxKind::ControlFlow,
-
-        (Language::Rust, "enum_variant")
-        | (Language::C | Language::Cpp, "declaration")
-        | (Language::Cpp, "template_declaration")
-        | (Language::Python, "decorated_definition")
-        | (
-            Language::Css,
-            "rule_set"
-            | "media_statement"
-            | "supports_statement"
-            | "scope_statement"
-            | "keyframes_statement",
-        )
-        | (Language::Html, "element" | "script_element" | "style_element") => SyntaxKind::Other,
-
-        _ => return None,
-    };
-
-    Some(kind)
 }
 
-/// Check whether a node is nested inside a method declaration.
-fn has_method_parent(node: Node<'_>) -> bool {
-    let mut parent = node.parent();
-    while let Some(node) = parent {
-        if matches!(
-            node.kind(),
-            "impl_item"
-                | "trait_item"
-                | "class_specifier"
-                | "class_declaration"
-                | "abstract_class_declaration"
-                | "interface_declaration"
-                | "extension_declaration"
-        ) {
-            return true;
-        }
-        parent = node.parent();
-    }
-    false
-}
-
-/// Check whether a Rust declaration has a test attribute.
-fn is_rust_test(declaration: &str) -> bool {
-    declaration.lines().any(|line| {
-        let attribute = line.trim();
-        attribute == "#[test]"
-            || attribute
-                .strip_prefix("#[")
-                .and_then(|attribute| attribute.split(['(', ']']).next())
-                .is_some_and(|attribute| attribute.ends_with("::test"))
-    })
+/// Check whether a context node is a control-flow construct.
+fn is_control_flow(node: Node<'_>) -> bool {
+    matches!(
+        node.kind(),
+        "if_expression"
+            | "match_expression"
+            | "for_expression"
+            | "while_expression"
+            | "loop_expression"
+            | "if_statement"
+            | "for_statement"
+            | "while_statement"
+            | "with_statement"
+            | "case_statement"
+            | "switch_statement"
+            | "match_statement"
+    )
 }
 
 /// Find the end of a compact declaration.
@@ -533,17 +382,12 @@ mod tests {
             .collect()
     }
 
-    fn kinds(entry: &SyntaxEntry) -> Vec<SyntaxKind> {
-        entry.items.iter().map(|item| item.kind).collect()
-    }
-
     #[test]
     fn changed_statement_identifies_free_function() {
         let entries = rust_context("fn calculate() {\n    let value = 2;\n}\n", &[(2, 1)]);
 
         assert_eq!(entries.len(), 1);
         assert_eq!(declarations(&entries[0]), ["fn calculate()"]);
-        assert_eq!(kinds(&entries[0]), [SyntaxKind::Function]);
     }
 
     #[test]
@@ -559,7 +403,6 @@ mod tests {
                 "pub async fn send_request(&self) -> Result<()>"
             ]
         );
-        assert_eq!(kinds(&entries[0]), [SyntaxKind::Impl, SyntaxKind::Method]);
     }
 
     #[test]
@@ -572,7 +415,6 @@ mod tests {
             declarations(&entries[0]),
             ["#[test]\nfn request_times_out()"]
         );
-        assert_eq!(kinds(&entries[0]), [SyntaxKind::Test]);
     }
 
     #[test]
@@ -606,19 +448,18 @@ mod tests {
             declarations(&entries[0]),
             ["struct Config", "request_timeout: Duration"]
         );
-        assert_eq!(kinds(&entries[0]), [SyntaxKind::Type, SyntaxKind::Field]);
     }
 
     #[test]
-    fn imports_and_constants_have_specific_semantic_kinds() {
+    fn imports_and_constants_are_retained_as_context() {
         let cases = [
-            ("use crate::client::Client;\n", SyntaxKind::Import),
-            ("const TIMEOUT: u64 = 120;\n", SyntaxKind::Constant),
+            ("use crate::client::Client;\n", "use crate::client::Client;"),
+            ("const TIMEOUT: u64 = 120;\n", "const TIMEOUT: u64 ="),
         ];
 
         for (source, expected) in cases {
             let entries = rust_context(source, &[(1, 1)]);
-            assert_eq!(entries[0].items.last().unwrap().kind, expected);
+            assert_eq!(entries[0].items.last().unwrap().declaration, expected);
         }
     }
 
@@ -649,10 +490,6 @@ mod tests {
         let source = "fn request() {\n    if timeout > 30 {\n        retry();\n    }\n}\n";
         let entries = rust_context(source, &[(2, 1)]);
 
-        assert_eq!(
-            kinds(&entries[0]),
-            [SyntaxKind::Function, SyntaxKind::ControlFlow]
-        );
         assert_eq!(
             declarations(&entries[0]),
             ["fn request()", "if timeout > 30"]

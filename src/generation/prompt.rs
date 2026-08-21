@@ -525,18 +525,15 @@ fn render_syntax_context(context: &SyntaxContext) -> String {
     rendered.trim_end().to_owned()
 }
 
-/// Check whether two syntax-entry lists have the same declarations and kinds.
+/// Check whether two syntax-entry lists have the same declarations.
 fn same_entries(before: &[SyntaxEntry], after: &[SyntaxEntry]) -> bool {
     before.len() == after.len()
         && before.iter().zip(after).all(|(before, after)| {
             before
                 .items
                 .iter()
-                .map(|item| (item.kind, &item.declaration))
-                .eq(after
-                    .items
-                    .iter()
-                    .map(|item| (item.kind, &item.declaration)))
+                .map(|item| &item.declaration)
+                .eq(after.items.iter().map(|item| &item.declaration))
         })
 }
 
@@ -688,13 +685,12 @@ fn estimate_tokens(text: &str) -> usize {
 mod tests {
     use std::path::PathBuf;
 
-    use crate::syntax::{SyntaxKind, SyntaxSide};
+    use crate::syntax::SyntaxSide;
 
     use super::*;
 
-    fn item(kind: SyntaxKind, declaration: &str, start_line: usize) -> SyntaxItem {
+    fn item(declaration: &str, start_line: usize) -> SyntaxItem {
         SyntaxItem {
-            kind,
             declaration: declaration.to_owned(),
             start_line,
         }
@@ -709,10 +705,7 @@ mod tests {
 
     #[test]
     fn identical_sides_render_once_as_shared_context() {
-        let items = vec![
-            item(SyntaxKind::Impl, "impl ApiClient", 1),
-            item(SyntaxKind::Method, "fn request(&self)", 2),
-        ];
+        let items = vec![item("impl ApiClient", 1), item("fn request(&self)", 2)];
         let context = SyntaxContext {
             language: crate::syntax::Language::Rust,
             before: Some(side("src/client.rs", items.clone())),
@@ -729,14 +722,8 @@ mod tests {
     fn changed_structure_renders_before_and_after_separately() {
         let context = SyntaxContext {
             language: crate::syntax::Language::Rust,
-            before: Some(side(
-                "src/client.rs",
-                vec![item(SyntaxKind::Impl, "impl OldClient", 1)],
-            )),
-            after: Some(side(
-                "src/client.rs",
-                vec![item(SyntaxKind::Impl, "impl Client", 1)],
-            )),
+            before: Some(side("src/client.rs", vec![item("impl OldClient", 1)])),
+            after: Some(side("src/client.rs", vec![item("impl Client", 1)])),
         };
 
         assert_eq!(
@@ -750,18 +737,12 @@ mod tests {
         let first = SyntaxContext {
             language: crate::syntax::Language::Json,
             before: None,
-            after: Some(side(
-                "config.json",
-                vec![item(SyntaxKind::Other, "\"timeout\":", 1)],
-            )),
+            after: Some(side("config.json", vec![item("\"timeout\":", 1)])),
         };
         let second = SyntaxContext {
             language: crate::syntax::Language::Rust,
             before: None,
-            after: Some(side(
-                "src/client.rs",
-                vec![item(SyntaxKind::Function, "fn request()", 1)],
-            )),
+            after: Some(side("src/client.rs", vec![item("fn request()", 1)])),
         };
         let budget = estimate_tokens(&syntax_context_section_text(&render_syntax_context(&first)));
 
