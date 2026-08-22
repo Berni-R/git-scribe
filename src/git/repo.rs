@@ -1,7 +1,7 @@
 use std::{fmt, path::Path};
 
 use anyhow::{Context as _, Result, bail};
-use git2::{Commit, ErrorCode, Repository, Tree};
+use git2::{Commit, Config, ErrorCode, Repository, Tree};
 
 /// A non-bare Git repository backed by `libgit2`.
 pub struct GitRepo(Repository);
@@ -44,6 +44,20 @@ impl GitRepo {
         })?;
 
         Ok(Self(repository))
+    }
+
+    /// Open this repository's local Git configuration.
+    ///
+    /// This deliberately excludes system and global Git configuration: git-scribe's
+    /// settings are scoped to the repository in which they are configured.
+    pub fn local_config(&self) -> Result<Config> {
+        let path = self.0.path().join("config");
+        Config::open(&path).with_context(|| {
+            format!(
+                "failed to open repository configuration at {}",
+                path.display()
+            )
+        })
     }
 
     /// Return the underlying `libgit2` repository for use within the Git abstraction.

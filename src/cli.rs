@@ -1,7 +1,8 @@
 use std::{path::PathBuf, time::Duration};
 
-use clap::Parser;
-use git_scribe::{git::CommitMode, ollama::Think};
+use anyhow::{Context as _, Result};
+use clap::{ArgMatches, Parser, ValueEnum as _, parser::ValueSource};
+use git_scribe::{GitRepo, git::CommitMode, ollama::Think};
 
 /// Parse a token count with optional `k` or `m` binary suffixes.
 fn parse_token_count(value: &str) -> Result<u32, String> {
@@ -34,7 +35,8 @@ fn parse_token_count(value: &str) -> Result<u32, String> {
 #[derive(Debug, Parser)]
 #[command(
     version,
-    about = "Generate a commit message, then open it in Git's editor or print it"
+    about = "Generate a commit message, then open it in Git's editor or print it",
+    after_help = "Repository defaults may be set in .git/config, for example:\n  git config --local git-scribe.think high\n\nSupported keys: git-scribe.think, git-scribe.showThinking, git-scribe.temperature, git-scribe.seed, git-scribe.keepAlive, git-scribe.timeout, and repeated git-scribe.excludeDiff values. Command-line options take precedence; --exclude-diff values are added to configured exclusions."
 )]
 #[allow(clippy::struct_excessive_bools)] // Independent command-line switches are naturally boolean.
 pub struct Cli {
@@ -125,7 +127,7 @@ pub struct Cli {
     pub keep_alive: Option<Duration>,
 
     /// Maximum time to wait for Ollama to respond, such as `30s`, `2m`, or `1h`.
-    #[arg(long, value_parser = humantime::parse_duration, default_value = "2m", help_heading = "Runtime")]
+    #[arg(long, value_parser = humantime::parse_duration, default_value = "10m", help_heading = "Runtime")]
     pub timeout: Duration,
 
     /// Print the model's structured analysis to stderr.
@@ -150,6 +152,98 @@ pub struct Cli {
 }
 
 impl Cli {
+    /// Apply repository-local defaults from `.git/config`.
+    ///
+    /// Values passed on the command line always take precedence. The supported
+    /// keys are `git-scribe.think`, `git-scribe.showThinking`,
+    /// `git-scribe.temperature`, `git-scribe.seed`, `git-scribe.keepAlive`,
+    /// `git-scribe.timeout`, and repeated `git-scribe.excludeDiff` values.
+    pub fn apply_local_config(&mut self, matches: &ArgMatches, repo: &GitRepo) -> Result<()> {
+        let config = repo.local_config()?;
+
+        Self::apply_config_value(matches, &config, "think", |value| {
+            Think::from_str(value, true)
+                .map(|think| self.think = think)
+                .map_err(|error| error.clone())
+        })?;
+        Self::apply_config_value(matches, &config, "show_thinking", |value| {
+            value
+                .parse::<bool>()
+                .map(|show_thinking| self.show_thinking = show_thinking)
+                .map_err(|error| error.to_string())
+        })?;
+        Self::apply_config_value(matches, &config, "temperature", |value| {
+            value
+                .parse::<f32>()
+                .map(|temperature| self.temperature = temperature)
+                .map_err(|error| error.to_string())
+        })?;
+        Self::apply_config_value(matches, &config, "seed", |value| {
+            value
+                .parse::<i64>()
+                .map(|seed| self.seed = Some(seed))
+                .map_err(|error| error.to_string())
+        })?;
+        Self::apply_config_value(matches, &config, "keep_alive", |value| {
+            humantime::parse_duration(value)
+                .map(|keep_alive| self.keep_alive = Some(keep_alive))
+                .map_err(|error| error.to_string())
+        })?;
+        Self::apply_config_value(matches, &config, "timeout", |value| {
+            humantime::parse_duration(value)
+                .map(|timeout| self.timeout = timeout)
+                .map_err(|error| error.to_string())
+        })?;
+        self.append_config_exclude_diffs(&config)?;
+
+        Ok(())
+    }
+
+    /// Configured exclusions are prepended so command-line occurrences retain
+    /// their order and add to, rather than replace, repository defaults.
+    fn append_config_exclude_diffs(&mut self, config: &git2::Config) -> Result<()> {
+        const KEY: &str = "git-scribe.excludeDiff";
+        let mut entries = match config.multivar(KEY, None) {
+            Ok(entries) => entries,
+            Err(error) if error.code() == git2::ErrorCode::NotFound => return Ok(()),
+            Err(error) => return Err(error).with_context(|| format!("failed to read {KEY}")),
+        };
+
+        let mut configured = Vec::new();
+        while let Some(entry) = entries.next() {
+            let value = entry
+                .with_context(|| format!("failed to read {KEY}"))?
+                .value()
+                .with_context(|| format!("invalid non-UTF-8 {KEY} value"))?;
+            if value.is_empty() {
+                anyhow::bail!("invalid {KEY} value: path must not be empty");
+            }
+            configured.push(PathBuf::from(value));
+        }
+        self.exclude_diff.splice(0..0, configured);
+        Ok(())
+    }
+
+    fn apply_config_value(
+        matches: &ArgMatches,
+        config: &git2::Config,
+        argument: &str,
+        apply: impl FnOnce(&str) -> std::result::Result<(), String>,
+    ) -> Result<()> {
+        if matches.value_source(argument) == Some(ValueSource::CommandLine) {
+            return Ok(());
+        }
+
+        let key = format!("git-scribe.{}", argument.replace('_', ""));
+        match config.get_string(&key) {
+            Ok(value) => apply(&value)
+                .map_err(anyhow::Error::msg)
+                .with_context(|| format!("invalid {key} value `{value}`")),
+            Err(error) if error.code() == git2::ErrorCode::NotFound => Ok(()),
+            Err(error) => Err(error).with_context(|| format!("failed to read {key}")),
+        }
+    }
+
     /// The [`CommitMode`] derived from the argument `--amend`.
     pub fn commit_mode(&self) -> CommitMode {
         if self.amend {
@@ -175,6 +269,7 @@ impl Cli {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::{CommandFactory as _, FromArgMatches as _};
 
     #[test]
     fn print_flag_selects_print_only_mode() {
@@ -205,10 +300,10 @@ mod tests {
     }
 
     #[test]
-    fn timeout_defaults_to_two_minutes() {
+    fn timeout_defaults_to_ten_minutes() {
         let cli = Cli::try_parse_from(["git-scribe"]).unwrap();
 
-        assert_eq!(cli.timeout, Duration::from_mins(2));
+        assert_eq!(cli.timeout, Duration::from_mins(10));
     }
 
     #[test]
@@ -266,5 +361,78 @@ mod tests {
         assert_eq!(long.think, Think::On);
         assert_eq!(short.think, Think::On);
         assert_eq!(level.think, Think::High);
+    }
+
+    #[test]
+    fn local_git_config_supplies_defaults_but_the_command_line_wins() -> anyhow::Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "git-scribe-cli-config-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        ));
+        let repository = git2::Repository::init(&path)?;
+        let mut config = repository.config()?;
+        config.set_str("git-scribe.think", "high")?;
+        config.set_bool("git-scribe.showThinking", true)?;
+        config.set_str("git-scribe.temperature", "0.25")?;
+        config.set_i64("git-scribe.seed", 42)?;
+        config.set_str("git-scribe.keepAlive", "1h")?;
+        config.set_str("git-scribe.timeout", "30s")?;
+        config.set_multivar("git-scribe.excludeDiff", "^$", "generated.css")?;
+        config.set_multivar("git-scribe.excludeDiff", "^$", "vendor/app.js")?;
+        drop(config);
+        drop(repository);
+
+        let repo = GitRepo::discover(&path)?;
+        let matches = Cli::command().try_get_matches_from(["git-scribe"])?;
+        let mut cli = Cli::from_arg_matches(&matches)?;
+        cli.apply_local_config(&matches, &repo)?;
+
+        assert_eq!(cli.think, Think::High);
+        assert!(cli.show_thinking);
+        assert!((cli.temperature - 0.25).abs() < f32::EPSILON);
+        assert_eq!(cli.seed, Some(42));
+        assert_eq!(cli.keep_alive, Some(Duration::from_hours(1)));
+        assert_eq!(cli.timeout, Duration::from_secs(30));
+        assert_eq!(
+            cli.exclude_diff,
+            [
+                PathBuf::from("generated.css"),
+                PathBuf::from("vendor/app.js")
+            ]
+        );
+
+        let matches = Cli::command().try_get_matches_from([
+            "git-scribe",
+            "--think=low",
+            "--temperature",
+            "0.5",
+            "--timeout",
+            "1m",
+            "--exclude-diff",
+            "manual.css",
+            "--exclude-diff",
+            "generated/types.ts",
+        ])?;
+        let mut cli = Cli::from_arg_matches(&matches)?;
+        cli.apply_local_config(&matches, &repo)?;
+        assert_eq!(cli.think, Think::Low);
+        assert!((cli.temperature - 0.5).abs() < f32::EPSILON);
+        assert_eq!(cli.timeout, Duration::from_mins(1));
+        assert_eq!(
+            cli.exclude_diff,
+            [
+                PathBuf::from("generated.css"),
+                PathBuf::from("vendor/app.js"),
+                PathBuf::from("manual.css"),
+                PathBuf::from("generated/types.ts"),
+            ]
+        );
+
+        drop(repo);
+        std::fs::remove_dir_all(path)?;
+        Ok(())
     }
 }

@@ -4,7 +4,7 @@
 use std::{fs, io::ErrorKind, path::Path};
 
 use anyhow::{Context as _, Result, bail};
-use clap::Parser as _;
+use clap::{CommandFactory as _, FromArgMatches as _};
 use git_scribe::{
     GitRepo,
     generation::{CommitMessage, Confidence, Prompt, PromptEstimate},
@@ -29,10 +29,11 @@ const THINKING_CONTEXT_RESERVE: u32 = 4_096;
 #[allow(clippy::too_many_lines)]
 #[allow(clippy::cast_precision_loss)]
 fn main() {
-    let args = cli::Cli::parse();
+    let matches = cli::Cli::command().get_matches();
+    let args = cli::Cli::from_arg_matches(&matches).expect("clap validated command-line arguments");
     let terminal = Terminal::new(!args.no_color, true).with_progress(!args.quiet);
 
-    if let Err(error) = run(&args, terminal) {
+    if let Err(error) = run(args, &matches, terminal) {
         terminal.error(&error);
         std::process::exit(1);
     }
@@ -40,12 +41,12 @@ fn main() {
 
 #[allow(clippy::too_many_lines)]
 #[allow(clippy::cast_precision_loss)]
-fn run(args: &cli::Cli, terminal: Terminal) -> Result<()> {
-    args.validate()?;
-    ensure_output_paths_are_available(args)?;
-    let mode = args.commit_mode();
-
+fn run(mut args: cli::Cli, matches: &clap::ArgMatches, terminal: Terminal) -> Result<()> {
     let repo = GitRepo::discover(&args.path)?;
+    args.apply_local_config(matches, &repo)?;
+    args.validate()?;
+    ensure_output_paths_are_available(&args)?;
+    let mode = args.commit_mode();
     let commit = repo.prospective_commit(mode)?;
 
     if commit.is_empty() && !args.amend {
@@ -376,6 +377,7 @@ fn write_new_file(path: &Path, contents: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser as _;
 
     #[test]
     fn existing_output_file_is_rejected_before_generation() {
