@@ -469,13 +469,17 @@ fn patch_blocks(patch: &[u8]) -> Vec<&[u8]> {
         .collect()
 }
 
-/// Check whether a change touches an excluded path.
+/// Check whether a change touches an excluded file or lies within an excluded directory.
 fn is_excluded(change: &CommitChange, excluded_paths: &[PathBuf]) -> bool {
     // TODO: specify to exclude just the before or after?
     [change.before(), change.after()]
         .into_iter()
         .flatten()
-        .any(|version| excluded_paths.iter().any(|path| path == &version.path))
+        .any(|version| {
+            excluded_paths
+                .iter()
+                .any(|path| path == &version.path || version.path.starts_with(path))
+        })
 }
 
 /// Keep complete file contexts in commit order within the global supporting-evidence budget.

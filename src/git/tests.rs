@@ -722,3 +722,32 @@ fn excluded_diff_file_keeps_status_but_omits_patch_and_affected_code() -> Result
     assert!(!prompt.text.contains("### generated.rs"));
     Ok(())
 }
+
+#[test]
+fn excluded_diff_directory_omits_all_descendant_patches_and_affected_code() -> Result<()> {
+    let fixture = Fixture::new()?;
+    fixture.write_and_stage("kept.rs", "pub fn kept() { old(); }\n")?;
+    fixture.write_and_stage("generated/client.rs", "fn client() { old(); }\n")?;
+    fixture.write_and_stage("generated/nested/types.rs", "fn types() { old(); }\n")?;
+    fixture.commit("initial")?;
+    fixture.write_and_stage("kept.rs", "pub fn kept() { new(); }\n")?;
+    fixture.write_and_stage("generated/client.rs", "fn client() { secret_client(); }\n")?;
+    fixture.write_and_stage(
+        "generated/nested/types.rs",
+        "fn types() { secret_types(); }\n",
+    )?;
+    let repo = fixture.git_repo()?;
+    let commit = repo.prospective_commit(CommitMode::Normal)?;
+
+    let prompt =
+        crate::generation::Prompt::new(&repo, &[], &commit, &[PathBuf::from("generated")], 10_000)?;
+
+    assert!(prompt.text.contains("M\tgenerated/client.rs"));
+    assert!(prompt.text.contains("M\tgenerated/nested/types.rs"));
+    assert!(prompt.text.contains("### kept.rs"));
+    assert!(!prompt.text.contains("### generated/client.rs"));
+    assert!(!prompt.text.contains("### generated/nested/types.rs"));
+    assert!(!prompt.text.contains("secret_client"));
+    assert!(!prompt.text.contains("secret_types"));
+    Ok(())
+}

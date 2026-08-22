@@ -53,3 +53,32 @@ Therefore, both forms are equivalent:
 git-scribe [OPTIONS]
 git scribe [OPTIONS]
 ```
+
+## Repository configuration
+
+Set defaults for a repository in its local Git configuration. Command-line options override
+configured scalar values.
+
+```sh
+git config --local git-scribe.think high
+git config --local git-scribe.showThinking true
+git config --local git-scribe.temperature 0.2
+git config --local git-scribe.seed 42
+git config --local git-scribe.keepAlive 1h
+git config --local git-scribe.timeout 30s
+```
+
+`excludeDiff` is repeatable. Use `--add` so Git preserves each configured path:
+
+```sh
+git config --local --add git-scribe.excludeDiff assets/tailwind.css
+git config --local --add git-scribe.excludeDiff assets/generated
+```
+
+Each `excludeDiff` value can be a repository-relative file or directory. A directory excludes
+every changed file below it. Configured exclusions are combined with any command-line
+`--exclude-diff` values, so this adds a temporary exclusion without replacing the configured ones:
+
+```sh
+git scribe --exclude-diff assets/daisyui-5.7.16.mjs
+```

@@ -64,9 +64,9 @@ pub struct Cli {
     #[arg(long, value_name = "TEXT", help_heading = "Prompt")]
     pub hint: Vec<String>,
 
-    /// Omit a repository-relative file's diff and syntax context from the prompt.
+    /// Omit a repository-relative file or directory's diff and syntax context from the prompt.
     ///
-    /// The file's status remains visible. Repeat to exclude multiple files.
+    /// Statuses remain visible. Repeat to exclude multiple files or directories.
     #[arg(short = 'x', long, value_name = "PATH", help_heading = "Prompt")]
     pub exclude_diff: Vec<PathBuf>,
 
