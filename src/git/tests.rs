@@ -579,38 +579,132 @@ fn symbolic_link_change_is_a_type_change() -> Result<()> {
 }
 
 #[test]
-fn syntax_context_consumes_owned_change_data() -> Result<()> {
+fn affected_code_reports_unchanged_public_entry_points() -> Result<()> {
     let fixture = Fixture::new()?;
-    fixture.write_and_stage("source.rs", "fn changed() {\n    let value = 1;\n}\n")?;
+    fixture.write_and_stage(
+        "source.rs",
+        "/// Update the configured value.\npub fn caller() {\n    changed();\n}\n\nfn changed() {\n    let value = 1;\n}\n",
+    )?;
     fixture.commit("initial")?;
-    fixture.write_and_stage("source.rs", "fn changed() {\n    let value = 2;\n}\n")?;
+    fixture.write_and_stage(
+        "source.rs",
+        "/// Update the configured value.\npub fn caller() {\n    changed();\n}\n\nfn changed() {\n    let value = 2;\n}\n",
+    )?;
     let repo = fixture.git_repo()?;
     let commit = repo.prospective_commit(CommitMode::Normal)?;
 
     let context = crate::syntax::context_for_change(&repo, only_change(&commit))?
-        .expect("Rust modification should have syntax context");
-    let before = context.before.as_ref().expect("before side");
-    let after = context.after.as_ref().expect("after side");
-    assert_eq!(before.entries.len(), 1);
-    assert_eq!(after.entries.len(), 1);
-    assert_eq!(after.entries[0].items[0].declaration, "fn changed()");
+        .expect("changed function with a production caller should have affected-code context");
+    assert_eq!(context.path, Path::new("source.rs"));
+    assert_eq!(context.affected[0].changed, "fn changed()");
+    assert_eq!(context.affected[0].entry_points[0].name, "caller");
+    assert_eq!(
+        context.affected[0].entry_points[0].documentation.as_deref(),
+        Some("Update the configured value")
+    );
 
     let prompt = crate::generation::Prompt::new(&repo, &[], &commit, &[], 10_000)?;
-    assert!(prompt.text.contains("## Syntax context"));
+    assert!(prompt.text.contains("## Affected code"));
     assert!(prompt.text.contains("### source.rs"));
-    assert!(prompt.text.contains("CONTEXT:\nfn changed()"));
-    assert!(!prompt.text.contains("BEFORE:\nfn changed()"));
-    assert!(!prompt.text.contains("AFTER:\nfn changed()"));
+    assert!(
+        prompt
+            .text
+            .contains("fn changed() affects:\n- caller — Update the configured value")
+    );
     Ok(())
 }
 
 #[test]
-fn excluded_diff_file_keeps_status_but_omits_patch_and_syntax_context() -> Result<()> {
+fn affected_code_reports_cross_file_callers() -> Result<()> {
     let fixture = Fixture::new()?;
-    fixture.write_and_stage("kept.rs", "fn kept() { old(); }\n")?;
+    fixture.write_and_stage("changed.rs", "pub fn changed() {\n    old();\n}\n")?;
+    fixture.write_and_stage(
+        "main.rs",
+        "fn main() {\n    run();\n}\n\nfn run() {\n    changed();\n}\n",
+    )?;
+    fixture.commit("initial")?;
+    fixture.write_and_stage("changed.rs", "pub fn changed() {\n    new();\n}\n")?;
+    let repo = fixture.git_repo()?;
+    let commit = repo.prospective_commit(CommitMode::Normal)?;
+
+    let context = crate::syntax::context_for_change(&repo, only_change(&commit))?
+        .expect("changed public function should have affected-code context");
+    assert_eq!(context.affected[0].external_callers.len(), 1);
+    assert_eq!(
+        context.affected[0].external_callers[0].path,
+        Path::new("main.rs")
+    );
+    assert_eq!(context.affected[0].external_callers[0].caller, "run");
+    assert_eq!(context.affected[0].external_callers[0].call, "changed();");
+    Ok(())
+}
+
+#[test]
+fn affected_code_reports_cross_file_associated_function_callers() -> Result<()> {
+    let fixture = Fixture::new()?;
+    fixture.write_and_stage(
+        "prompt.rs",
+        "pub struct Prompt;\n\nimpl Prompt {\n    pub fn new() {\n        old();\n    }\n}\n",
+    )?;
+    fixture.write_and_stage(
+        "main.rs",
+        "fn main() {\n    run();\n}\n\nfn run() {\n    Prompt::new();\n}\n",
+    )?;
+    fixture.commit("initial")?;
+    fixture.write_and_stage(
+        "prompt.rs",
+        "pub struct Prompt;\n\nimpl Prompt {\n    pub fn new() {\n        new();\n    }\n}\n",
+    )?;
+    let repo = fixture.git_repo()?;
+    let commit = repo.prospective_commit(CommitMode::Normal)?;
+
+    let context = crate::syntax::context_for_change(&repo, only_change(&commit))?
+        .expect("changed public associated function should have affected-code context");
+    assert_eq!(context.affected[0].external_callers.len(), 1);
+    assert_eq!(
+        context.affected[0].external_callers[0].path,
+        Path::new("main.rs")
+    );
+    assert_eq!(context.affected[0].external_callers[0].caller, "run");
+    assert_eq!(
+        context.affected[0].external_callers[0].call,
+        "Prompt::new();"
+    );
+    Ok(())
+}
+
+#[test]
+fn tests_and_changed_callers_are_omitted_from_affected_code() -> Result<()> {
+    let fixture = Fixture::new()?;
+    fixture.write_and_stage(
+        "source.rs",
+        "fn caller() {\n    changed();\n    old_caller();\n}\n\nfn changed() {\n    old();\n}\n\n#[cfg(test)]\nmod tests {\n    fn checks() {\n        changed();\n    }\n}\n",
+    )?;
+    fixture.commit("initial")?;
+    fixture.write_and_stage(
+        "source.rs",
+        "fn caller() {\n    changed();\n    new_caller();\n}\n\nfn changed() {\n    new();\n}\n\n#[cfg(test)]\nmod tests {\n    fn checks() {\n        changed();\n    }\n}\n",
+    )?;
+    let repo = fixture.git_repo()?;
+    let commit = repo.prospective_commit(CommitMode::Normal)?;
+
+    assert!(crate::syntax::context_for_change(&repo, only_change(&commit))?.is_none());
+    Ok(())
+}
+
+#[test]
+fn excluded_diff_file_keeps_status_but_omits_patch_and_affected_code() -> Result<()> {
+    let fixture = Fixture::new()?;
+    fixture.write_and_stage(
+        "kept.rs",
+        "pub fn caller() { kept(); }\nfn kept() { old(); }\n",
+    )?;
     fixture.write_and_stage("generated.rs", "fn generated() { old(); }\n")?;
     fixture.commit("initial")?;
-    fixture.write_and_stage("kept.rs", "fn kept() { new(); }\n")?;
+    fixture.write_and_stage(
+        "kept.rs",
+        "pub fn caller() { kept(); }\nfn kept() { new(); }\n",
+    )?;
     fixture.write_and_stage("generated.rs", "fn generated() { secret(); }\n")?;
     let repo = fixture.git_repo()?;
     let commit = repo.prospective_commit(CommitMode::Normal)?;
@@ -624,114 +718,7 @@ fn excluded_diff_file_keeps_status_but_omits_patch_and_syntax_context() -> Resul
     )?;
 
     assert!(prompt.text.contains("M\tgenerated.rs"));
-    assert!(prompt.text.contains("fn kept() { new(); }"));
     assert!(prompt.text.contains("### kept.rs"));
-    assert!(!prompt.text.contains("secret();"));
     assert!(!prompt.text.contains("### generated.rs"));
-    Ok(())
-}
-
-#[test]
-fn added_function_has_after_syntax_context_only() -> Result<()> {
-    let fixture = Fixture::new()?;
-    fixture.write_and_stage("added.rs", "pub fn added() {\n    work();\n}\n")?;
-    let repo = fixture.git_repo()?;
-    let commit = repo.prospective_commit(CommitMode::Normal)?;
-
-    let context = crate::syntax::context_for_change(&repo, only_change(&commit))?
-        .expect("added Rust function should have syntax context");
-    assert!(context.before.is_none());
-    let after = context.after.as_ref().expect("after side");
-    assert_eq!(after.path, Path::new("added.rs"));
-    assert_eq!(after.entries.len(), 1);
-    assert_eq!(after.entries[0].items[0].declaration, "pub fn added()");
-    Ok(())
-}
-
-#[test]
-fn deleted_function_has_before_syntax_context_only() -> Result<()> {
-    let fixture = Fixture::new()?;
-    fixture.write_and_stage("deleted.rs", "fn deleted() {\n    work();\n}\n")?;
-    fixture.commit("initial")?;
-    fixture.delete_and_stage("deleted.rs")?;
-    let repo = fixture.git_repo()?;
-    let commit = repo.prospective_commit(CommitMode::Normal)?;
-
-    let context = crate::syntax::context_for_change(&repo, only_change(&commit))?
-        .expect("deleted Rust function should have syntax context");
-    let before = context.before.as_ref().expect("before side");
-    assert!(context.after.is_none());
-    assert_eq!(before.path, Path::new("deleted.rs"));
-    assert_eq!(before.entries.len(), 1);
-    assert_eq!(before.entries[0].items[0].declaration, "fn deleted()");
-    Ok(())
-}
-
-#[test]
-fn rename_with_edit_uses_both_paths_and_blobs_for_syntax() -> Result<()> {
-    let fixture = Fixture::new()?;
-    let before = "fn process() {\n    step_1();\n    step_2();\n    step_3();\n    step_4();\n    step_5();\n    step_6();\n}\n";
-    let after = before.replace("step_4();", "changed_step();");
-    fixture.write_and_stage("old.rs", before)?;
-    fixture.commit("initial")?;
-    fixture.rename_and_stage("old.rs", "new.rs")?;
-    fixture.write_and_stage("new.rs", &after)?;
-    let repo = fixture.git_repo()?;
-    let commit = repo.prospective_commit(CommitMode::Normal)?;
-
-    let change = only_change(&commit);
-    assert!(matches!(change.kind, CommitChangeKind::Renamed { .. }));
-    let context = crate::syntax::context_for_change(&repo, change)?
-        .expect("edited Rust rename should have syntax context");
-    let before = context.before.as_ref().expect("before side");
-    let after = context.after.as_ref().expect("after side");
-    assert_eq!(before.path, Path::new("old.rs"));
-    assert_eq!(after.path, Path::new("new.rs"));
-    assert_eq!(before.entries[0].items[0].declaration, "fn process()");
-    assert_eq!(after.entries[0].items[0].declaration, "fn process()");
-    let prompt = crate::generation::Prompt::new(&repo, &[], &commit, &[], 10_000)?;
-    assert!(prompt.text.contains("### old.rs -> new.rs"));
-    Ok(())
-}
-
-#[test]
-fn syntax_context_preserves_different_before_and_after_structure() -> Result<()> {
-    let fixture = Fixture::new()?;
-    fixture.write_and_stage("scope.rs", "fn production() {\n    changed();\n}\n")?;
-    fixture.commit("initial")?;
-    fixture.write_and_stage(
-        "scope.rs",
-        "#[test]\nfn changed_test() {\n    changed();\n}\n",
-    )?;
-    let repo = fixture.git_repo()?;
-    let commit = repo.prospective_commit(CommitMode::Normal)?;
-
-    let context = crate::syntax::context_for_change(&repo, only_change(&commit))?
-        .expect("scope change should have syntax context");
-    let before = context.before.as_ref().expect("before side");
-    let after = context.after.as_ref().expect("after side");
-    assert_eq!(before.entries[0].items[0].declaration, "fn production()");
-    assert_eq!(
-        after.entries[0].items[0].declaration,
-        "#[test]\nfn changed_test()"
-    );
-    let prompt = crate::generation::Prompt::new(&repo, &[], &commit, &[], 10_000)?;
-    assert!(prompt.text.contains("BEFORE:\nfn production()"));
-    assert!(prompt.text.contains("AFTER:\n#[test]\nfn changed_test()"));
-    Ok(())
-}
-
-#[test]
-fn unsupported_file_has_no_syntax_context_or_prompt_section() -> Result<()> {
-    let fixture = Fixture::new()?;
-    fixture.write_and_stage("notes.unknown", "before\n")?;
-    fixture.commit("initial")?;
-    fixture.write_and_stage("notes.unknown", "after\n")?;
-    let repo = fixture.git_repo()?;
-    let commit = repo.prospective_commit(CommitMode::Normal)?;
-
-    assert!(crate::syntax::context_for_change(&repo, only_change(&commit))?.is_none());
-    let prompt = crate::generation::Prompt::new(&repo, &[], &commit, &[], 10_000)?;
-    assert!(!prompt.text.contains("## Syntax context"));
     Ok(())
 }

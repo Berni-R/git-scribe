@@ -76,14 +76,8 @@ fn run(args: &cli::Cli, terminal: Terminal) -> Result<()> {
             Some(NUM_PREDICT),
         )
     };
-    let estimate = Prompt::estimate(
-        &repo,
-        &args.hint,
-        &commit,
-        &args.exclude_diff,
-        thinking_tokens,
-        generation_tokens,
-    )?;
+    let preparation = Prompt::prepare(&repo, &args.hint, &commit, &args.exclude_diff)?;
+    let estimate = preparation.estimate(thinking_tokens, generation_tokens)?;
     let prompt_token_budget = match Prompt::available_tokens(args.context_window, predict_reserve) {
         Ok(budget) => budget,
         Err(error) => {
@@ -96,13 +90,7 @@ fn run(args: &cli::Cli, terminal: Terminal) -> Result<()> {
         }
     };
 
-    let prompt = match Prompt::new(
-        &repo,
-        &args.hint,
-        &commit,
-        &args.exclude_diff,
-        prompt_token_budget,
-    ) {
+    let prompt = match preparation.build(prompt_token_budget) {
         Ok(prompt) => prompt,
         Err(error) => {
             return Err(error.context(report_budget_overflow(
